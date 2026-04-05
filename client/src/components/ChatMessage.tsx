@@ -1,6 +1,7 @@
 import { GitBranch } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ChatMessage as MessageType } from "@jchat/shared";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 interface ChatMessageProps {
   message: MessageType;
@@ -26,7 +27,7 @@ export function ChatMessage({ message, onFork, hasForks }: ChatMessageProps) {
           )}
         >
           {message.content ? (
-            <p className="whitespace-pre-wrap">{message.content}</p>
+            <MarkdownRenderer content={message.content} />
           ) : (
             <p className="animate-pulse text-muted-foreground">思考中...</p>
           )}

@@ -72,7 +72,7 @@ export function ChatWorkspace() {
         onSelect={handleSwitchBranch}
       />
 
-      <div className="flex min-w-0 flex-1 flex-col md:w-full">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden md:w-full">
         <ChatWorkspaceHeader
           chatCurrentBranchId={chat?.currentBranchId}
           branches={branches}
