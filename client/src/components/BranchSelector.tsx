@@ -53,7 +53,7 @@ export function BranchSelector({
 
       {open && (
         <div
-          className="absolute right-0 top-full z-50 mt-1 min-w-[160px]
+          className="absolute right-0 top-full z-50 mt-1 min-w-40
                       rounded-md border bg-popover p-1 shadow-md"
         >
           {branches.map((branch) => (
