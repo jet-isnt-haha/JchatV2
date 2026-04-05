@@ -1,53 +1,137 @@
-import { useState, useRef } from 'react';
-import type { ChatMessage, ChatRequest, ChatStartResponse, ChatStreamChunk } from '@jchat/shared';
+import { useState, useRef, useCallback } from "react";
+import type {
+  Chat,
+  ChatBranch,
+  BranchTreeNode,
+  BranchTreeResponse,
+  ChatMessage,
+  ChatStreamChunk,
+  CreateChatResponse,
+  SendMessageResponse,
+  CreateBranchResponse,
+  SwitchBranchResponse,
+  BranchMessagesResponse,
+} from "@jchat/shared";
 
 export function useChat() {
+  const [chat, setChat] = useState<Chat | null>(null);
+  const [branches, setBranches] = useState<ChatBranch[]>([]);
+  const [branchTree, setBranchTree] = useState<BranchTreeNode[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const messagesRef = useRef(messages);
-  messagesRef.current = messages;
 
-  async function sendMessage(content: string) {
-    if (isLoading) return;
+  const chatRef = useRef(chat);
+  chatRef.current = chat;
 
-    const userMessage: ChatMessage = { role: 'user', content };
-    const messagesToSend = [...messagesRef.current, userMessage];
+  const initChat = useCallback(async (): Promise<CreateChatResponse> => {
+    const res = await fetch("/api/chats", { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data: CreateChatResponse = await res.json();
+    setChat(data.chat);
+    setBranches([data.branch]);
+    setBranchTree([
+      {
+        id: data.branch.id,
+        chatId: data.branch.chatId,
+        name: data.branch.name,
+        baseMessageId: data.branch.baseMessageId,
+        parentBranchId: null,
+        createdAt: data.branch.createdAt,
+        isCurrent: true,
+        children: [],
+      },
+    ]);
+    return data;
+  }, []);
 
-    setMessages([...messagesToSend, { role: 'assistant', content: '' }]);
-    setIsLoading(true);
+  const loadBranchTree = useCallback(async (chatId: string) => {
+    const res = await fetch(`/api/chats/${chatId}/branch-tree`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { nodes }: BranchTreeResponse = await res.json();
+    setBranchTree(nodes);
+  }, []);
 
-    try {
-      // 第一步：POST 消息列表，获取 chatId
-      const request: ChatRequest = { messages: messagesToSend };
-      const startRes = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-      });
-      if (!startRes.ok) throw new Error(`HTTP ${startRes.status}`);
+  const loadBranchMessages = useCallback(
+    async (chatId: string, branchId: string) => {
+      const res = await fetch(
+        `/api/chats/${chatId}/branches/${branchId}/messages`,
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const { messages: chain }: BranchMessagesResponse = await res.json();
+      setMessages(chain);
+    },
+    [],
+  );
 
-      const { chatId }: ChatStartResponse = await startRes.json();
+  const sendMessage = useCallback(
+    async (content: string) => {
+      if (isLoading) return;
+      setIsLoading(true);
 
-      // 第二步：用 EventSource 建立 SSE 连接接收流式输出
-      await receiveStream(chatId);
-    } catch (err) {
-      console.error('Chat error:', err);
-      setMessages((prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (!last.content) {
-          next[next.length - 1] = { ...last, content: '发生错误，请重试。' };
+      try {
+        let currentChat = chatRef.current;
+
+        if (!currentChat) {
+          const { chat: newChat } = await initChat();
+          currentChat = newChat;
         }
-        return next;
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  }
 
-  function receiveStream(chatId: string): Promise<void> {
+        const res = await fetch(`/api/chats/${currentChat.id}/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            branchId: currentChat.currentBranchId,
+            content,
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const {
+          userMessage,
+          assistantMessage,
+          streamSessionId,
+        }: SendMessageResponse = await res.json();
+
+        setMessages((prev) => [
+          ...prev,
+          userMessage,
+          { ...assistantMessage, content: "" },
+        ]);
+
+        await receiveStream(
+          currentChat.id,
+          streamSessionId,
+          assistantMessage.id,
+        );
+      } catch (err) {
+        console.error("Chat error:", err);
+        setMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last && !last.content) {
+            next[next.length - 1] = {
+              ...last,
+              content: "发生错误，请重试。",
+            };
+          }
+          return next;
+        });
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [isLoading, initChat],
+  );
+
+  function receiveStream(
+    chatId: string,
+    sessionId: string,
+    assistantMsgId: string,
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
-      const source = new EventSource(`/api/chat/${chatId}/stream`);
+      const source = new EventSource(
+        `/api/chats/${chatId}/stream/${sessionId}`,
+      );
 
       source.onmessage = (event) => {
         const chunk: ChatStreamChunk = JSON.parse(event.data as string);
@@ -58,18 +142,76 @@ export function useChat() {
         }
         setMessages((prev) => {
           const next = [...prev];
-          const last = next[next.length - 1];
-          next[next.length - 1] = { ...last, content: last.content + chunk.content };
+          const idx = next.findIndex((m) => m.id === assistantMsgId);
+          if (idx !== -1) {
+            next[idx] = {
+              ...next[idx],
+              content: next[idx].content + chunk.content,
+            };
+          }
           return next;
         });
       };
 
       source.onerror = () => {
         source.close();
-        reject(new Error('SSE connection error'));
+        reject(new Error("SSE connection error"));
       };
     });
   }
 
-  return { messages, isLoading, sendMessage };
+  const forkBranch = useCallback(
+    async (baseMessageId: string, name?: string) => {
+      const currentChat = chatRef.current;
+      if (!currentChat) return;
+
+      const res = await fetch(`/api/chats/${currentChat.id}/branches`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ baseMessageId, name }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const { branch, chat: updatedChat }: CreateBranchResponse =
+        await res.json();
+      setChat(updatedChat);
+      setBranches((prev) => [...prev, branch]);
+
+      await loadBranchTree(currentChat.id);
+      await loadBranchMessages(currentChat.id, branch.id);
+    },
+    [loadBranchMessages, loadBranchTree],
+  );
+
+  const switchBranch = useCallback(
+    async (branchId: string) => {
+      const currentChat = chatRef.current;
+      if (!currentChat) return;
+
+      const res = await fetch(`/api/chats/${currentChat.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentBranchId: branchId }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const { chat: updatedChat }: SwitchBranchResponse = await res.json();
+      setChat(updatedChat);
+
+      await loadBranchTree(currentChat.id);
+      await loadBranchMessages(currentChat.id, branchId);
+    },
+    [loadBranchMessages, loadBranchTree],
+  );
+
+  return {
+    chat,
+    branches,
+    branchTree,
+    messages,
+    isLoading,
+    sendMessage,
+    forkBranch,
+    switchBranch,
+  };
 }

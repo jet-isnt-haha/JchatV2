@@ -1,1 +1,19 @@
-export type { ChatMessage, ChatRequest, ChatStartResponse, ChatStreamChunk } from './types/chat';
+export type {
+  ChatMessage,
+  ChatBranch,
+  Chat,
+  BranchTreeNode,
+  BranchTreeResponse,
+  CreateChatResponse,
+  ChatDetailResponse,
+  CreateBranchRequest,
+  CreateBranchResponse,
+  SwitchBranchRequest,
+  SwitchBranchResponse,
+  BranchMessagesResponse,
+  SendMessageRequest,
+  SendMessageResponse,
+  ChatStreamChunk,
+  LegacyChatRequest,
+  LegacyChatStartResponse,
+} from "./types/chat";
