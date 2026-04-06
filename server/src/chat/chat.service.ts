@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { GoneException, Injectable, NotFoundException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
@@ -6,19 +6,34 @@ import type {
   Chat,
   ChatBranch,
   ChatMessage,
+  ChatStreamChunk,
   BranchTreeResponse,
   BranchTreeNode,
 } from "@jchat/shared";
 import { randomUUID } from "crypto";
 import { InMemoryChatRepository } from "./chat.repository";
 
+type StreamStatus = "pending" | "streaming" | "completed" | "failed";
+
 interface StreamSession {
+  streamId: string;
   messageId: string;
   messages: ChatMessage[];
+  status: StreamStatus;
+  seq: number;
+  fullContent: string;
+  chunks: ChatStreamChunk[];
+  listeners: Set<(chunk: ChatStreamChunk) => void>;
+  expireAt: number;
+  started: boolean;
 }
 
 @Injectable()
 export class ChatService {
+  private static readonly STREAM_TTL_MS = 2 * 60 * 1000;
+  private static readonly MAX_CHUNKS_PER_SESSION = 10000;
+  private static readonly MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+
   private llm: ChatOpenAI;
   private streamSessions = new Map<string, StreamSession>();
 
@@ -244,9 +259,18 @@ export class ChatService {
     const chain = this.repository.getAncestorChain(userMessage.id);
 
     const sessionId = randomUUID();
+    const nowTs = Date.now();
     this.streamSessions.set(sessionId, {
+      streamId: sessionId,
       messageId: assistantMessage.id,
       messages: chain,
+      status: "pending",
+      seq: 0,
+      fullContent: "",
+      chunks: [],
+      listeners: new Set(),
+      expireAt: nowTs + ChatService.STREAM_TTL_MS,
+      started: false,
     });
 
     return { userMessage, assistantMessage, streamSessionId: sessionId };
@@ -254,32 +278,82 @@ export class ChatService {
 
   // ===== Streaming =====
 
-  async *streamFromSession(sessionId: string): AsyncGenerator<string> {
+  async *streamFromSession(
+    sessionId: string,
+    cursorSeq = 0,
+  ): AsyncGenerator<ChatStreamChunk> {
+    // Opportunistic cleanup: we clean old sessions when any stream request arrives.
+    this.cleanupExpiredSessions();
+
     const session = this.streamSessions.get(sessionId);
-    if (!session) throw new NotFoundException(`Stream session not found`);
+    if (!session) {
+      throw new NotFoundException("Stream session not found");
+    }
 
-    this.streamSessions.delete(sessionId);
+    if (session.expireAt <= Date.now()) {
+      this.streamSessions.delete(sessionId);
+      throw new GoneException("Stream session expired");
+    }
 
-    const langchainMessages = session.messages.map((msg) =>
-      msg.role === "user"
-        ? new HumanMessage(msg.content)
-        : new AIMessage(msg.content),
-    );
+    // Extend TTL on access so short network blips within the window can recover.
+    this.touchSession(session);
+    this.ensureSessionStarted(session).catch(() => {
+      // Errors are converted to terminal chunks by ensureSessionStarted.
+    });
 
-    let fullContent = "";
-    const stream = await this.llm.stream(langchainMessages);
-
-    for await (const chunk of stream) {
-      if (typeof chunk.content === "string" && chunk.content) {
-        fullContent += chunk.content;
-        yield chunk.content;
+    // Replay missing buffered chunks first, then attach to live stream.
+    let localCursor = Math.max(0, cursorSeq);
+    const buffered = session.chunks.filter((chunk) => chunk.seq > localCursor);
+    for (const chunk of buffered) {
+      localCursor = chunk.seq;
+      yield chunk;
+      if (chunk.done) {
+        return;
       }
     }
 
-    if (session.messageId) {
-      this.repository.updateMessage(session.messageId, {
-        content: fullContent,
-      });
+    if (session.status === "completed" || session.status === "failed") {
+      return;
+    }
+
+    const queue: ChatStreamChunk[] = [];
+    let notify: (() => void) | null = null;
+
+    const listener = (chunk: ChatStreamChunk) => {
+      // Dedupe by seq to avoid duplicated render after reconnect.
+      if (chunk.seq > localCursor) {
+        queue.push(chunk);
+        if (notify) {
+          notify();
+          notify = null;
+        }
+      }
+    };
+
+    session.listeners.add(listener);
+
+    try {
+      while (true) {
+        if (queue.length === 0) {
+          await new Promise<void>((resolve) => {
+            notify = resolve;
+          });
+        }
+
+        while (queue.length > 0) {
+          const chunk = queue.shift()!;
+          localCursor = chunk.seq;
+          yield chunk;
+          if (chunk.done) {
+            return;
+          }
+        }
+      }
+    } finally {
+      session.listeners.delete(listener);
+      if (notify) {
+        notify();
+      }
     }
   }
 
@@ -301,10 +375,145 @@ export class ChatService {
     }));
 
     this.streamSessions.set(sessionId, {
+      streamId: sessionId,
       messageId: "",
       messages: converted,
+      status: "pending",
+      seq: 0,
+      fullContent: "",
+      chunks: [],
+      listeners: new Set(),
+      expireAt: Date.now() + ChatService.STREAM_TTL_MS,
+      started: false,
     });
 
     return sessionId;
+  }
+
+  private async ensureSessionStarted(session: StreamSession): Promise<void> {
+    if (session.started) {
+      return;
+    }
+
+    // A stream session is started at most once; all reconnects reuse buffered/live chunks.
+    session.started = true;
+    session.status = "streaming";
+    this.touchSession(session);
+
+    const langchainMessages = session.messages.map((msg) =>
+      msg.role === "user"
+        ? new HumanMessage(msg.content)
+        : new AIMessage(msg.content),
+    );
+
+    try {
+      const stream = await this.llm.stream(langchainMessages);
+      let stoppedByLimit = false;
+
+      for await (const chunk of stream) {
+        if (typeof chunk.content === "string" && chunk.content) {
+          session.fullContent += chunk.content;
+          const appended = this.appendChunk(session, {
+            streamId: session.streamId,
+            content: chunk.content,
+            done: false,
+          });
+          if (!appended) {
+            stoppedByLimit = true;
+            break;
+          }
+        }
+      }
+
+      if (session.messageId) {
+        this.repository.updateMessage(session.messageId, {
+          content: session.fullContent,
+        });
+      }
+
+      if (!stoppedByLimit) {
+        session.status = "completed";
+        this.appendChunk(session, {
+          streamId: session.streamId,
+          content: "",
+          done: true,
+        });
+      }
+    } catch {
+      session.status = "failed";
+      this.appendChunk(session, {
+        streamId: session.streamId,
+        content: "",
+        done: true,
+        errorCode: "STREAM_FAILED",
+      });
+    }
+  }
+
+  private appendChunk(
+    session: StreamSession,
+    chunk: Omit<ChatStreamChunk, "seq">,
+  ): boolean {
+    // Service assigns the canonical seq, clients only consume/dedupe by seq.
+    session.seq += 1;
+    const nextChunk: ChatStreamChunk = {
+      ...chunk,
+      seq: session.seq,
+    };
+
+    session.chunks.push(nextChunk);
+    this.touchSession(session);
+
+    if (
+      session.chunks.length > ChatService.MAX_CHUNKS_PER_SESSION ||
+      this.getSessionBufferBytes(session) > ChatService.MAX_BUFFER_BYTES
+    ) {
+      // When memory guard is hit, push a terminal error chunk so clients can stop gracefully.
+      session.status = "failed";
+      const limitChunk: ChatStreamChunk = {
+        streamId: session.streamId,
+        seq: session.seq,
+        content: "",
+        done: true,
+        errorCode: "STREAM_BUFFER_LIMIT",
+      };
+
+      if (!nextChunk.done) {
+        session.seq += 1;
+        limitChunk.seq = session.seq;
+        session.chunks.push(limitChunk);
+      }
+
+      for (const listener of session.listeners) {
+        listener(nextChunk.done ? nextChunk : limitChunk);
+      }
+      return false;
+    }
+
+    for (const listener of session.listeners) {
+      listener(nextChunk);
+    }
+
+    return true;
+  }
+
+  private getSessionBufferBytes(session: StreamSession): number {
+    return session.chunks.reduce(
+      (sum, chunk) => sum + Buffer.byteLength(chunk.content, "utf8"),
+      0,
+    );
+  }
+
+  private touchSession(session: StreamSession): void {
+    session.expireAt = Date.now() + ChatService.STREAM_TTL_MS;
+  }
+
+  private cleanupExpiredSessions(): void {
+    const now = Date.now();
+    for (const [id, session] of this.streamSessions.entries()) {
+      if (session.expireAt <= now) {
+        this.streamSessions.delete(id);
+      }
+    }
   }
 }

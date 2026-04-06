@@ -47,7 +47,15 @@ export const chatApi = {
     });
   },
 
-  createStream(chatId: string, sessionId: string) {
-    return new EventSource(`/api/chats/${chatId}/stream/${sessionId}`);
+  createStream(chatId: string, sessionId: string, cursorSeq?: number) {
+    const params = new URLSearchParams();
+    if (typeof cursorSeq === "number" && cursorSeq > 0) {
+      params.set("cursorSeq", String(cursorSeq));
+    }
+    const query = params.toString();
+    const url = query
+      ? `/api/chats/${chatId}/stream/${sessionId}?${query}`
+      : `/api/chats/${chatId}/stream/${sessionId}`;
+    return new EventSource(url);
   },
 };

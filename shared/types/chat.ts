@@ -90,8 +90,11 @@ export interface SendMessageResponse {
 }
 
 export interface ChatStreamChunk {
+  streamId: string;
+  seq: number;
   content: string;
   done: boolean;
+  errorCode?: string;
 }
 
 // ===== Legacy Compatibility =====

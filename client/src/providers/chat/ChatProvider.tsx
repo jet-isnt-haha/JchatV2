@@ -84,34 +84,106 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       sessionId: string,
       assistantMsgId: string,
     ): Promise<void> => {
-      return new Promise((resolve, reject) => {
-        const source = chatApi.createStream(chatId, sessionId);
+      // Keep retrying within the same 2-minute recover window defined by PRD.
+      const reconnectDeadline = Date.now() + 2 * 60 * 1000;
+      let lastSeq = 0;
+      let reconnectCount = 0;
 
-        source.onmessage = (event) => {
-          const chunk: ChatStreamChunk = JSON.parse(event.data as string);
-          if (chunk.done) {
-            source.close();
+      const connect = (cursorSeq: number): Promise<void> =>
+        new Promise((resolve, reject) => {
+          const source = chatApi.createStream(chatId, sessionId, cursorSeq);
+          // 复现断线重连
+          /*   let settled = false;
+
+          const cleanup = () => {
+            window.removeEventListener("offline", handleOffline);
+          };
+
+          const settleResolve = () => {
+            if (settled) return;
+            settled = true;
+            cleanup();
             resolve();
-            return;
-          }
+          };
 
-          setMessages((prev) => {
-            const next = [...prev];
-            const idx = next.findIndex((m) => m.id === assistantMsgId);
-            if (idx !== -1) {
-              next[idx] = {
-                ...next[idx],
-                content: next[idx].content + chunk.content,
-              };
+          const settleReject = (error: Error) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(error);
+          };
+
+          const handleOffline = () => {
+            source.close();
+            settleReject(new Error("BROWSER_OFFLINE"));
+          };
+
+          window.addEventListener("offline", handleOffline); */
+
+          source.onmessage = (event) => {
+            const chunk: ChatStreamChunk = JSON.parse(event.data as string);
+
+            // Ignore replayed/duplicate chunks on reconnect.
+            if (chunk.seq <= lastSeq) {
+              return;
             }
-            return next;
-          });
+            lastSeq = chunk.seq;
+
+            if (chunk.done) {
+              source.close();
+
+              if (chunk.errorCode) {
+                reject(new Error(chunk.errorCode));
+                // settleReject(new Error(chunk.errorCode));
+                return;
+              }
+              resolve();
+              // settleResolve();
+              return;
+            }
+
+            setMessages((prev) => {
+              const next = [...prev];
+              const idx = next.findIndex((m) => m.id === assistantMsgId);
+              if (idx !== -1) {
+                next[idx] = {
+                  ...next[idx],
+                  content: next[idx].content + chunk.content,
+                };
+              }
+              return next;
+            });
+          };
+
+          source.onerror = () => {
+            source.close();
+            reject(new Error("SSE connection error"));
+            // settleReject(new Error("SSE connection error"));
+          };
+        });
+
+      return new Promise((resolve, reject) => {
+        const attempt = async () => {
+          try {
+            await connect(lastSeq);
+            resolve();
+          } catch (error) {
+            if (Date.now() >= reconnectDeadline) {
+              reject(error);
+              return;
+            }
+
+            // Exponential backoff keeps reconnect aggressive at first but bounded.
+            reconnectCount += 1;
+            const delay = Math.min(
+              2000,
+              200 * 2 ** Math.min(reconnectCount, 4),
+            );
+            window.setTimeout(attempt, delay);
+          }
         };
 
-        source.onerror = () => {
-          source.close();
-          reject(new Error("SSE connection error"));
-        };
+        void attempt();
       });
     },
     [],

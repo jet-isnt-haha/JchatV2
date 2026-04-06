@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Sse,
 } from "@nestjs/common";
 import { Observable } from "rxjs";
@@ -23,6 +24,7 @@ import type {
   SendMessageResponse,
   LegacyChatRequest,
   LegacyChatStartResponse,
+  ChatStreamChunk,
 } from "@jchat/shared";
 
 @Controller("api")
@@ -84,8 +86,13 @@ export class ChatController {
   @Sse("chats/:chatId/stream/:sessionId")
   streamNewChat(
     @Param("sessionId") sessionId: string,
+    @Query("cursorSeq") cursorSeq?: string,
   ): Observable<MessageEvent> {
-    return this.buildStreamObservable(sessionId);
+    const parsedCursor = Number.parseInt(cursorSeq ?? "0", 10);
+    const safeCursor = Number.isNaN(parsedCursor)
+      ? 0
+      : Math.max(parsedCursor, 0);
+    return this.buildStreamObservable(sessionId, safeCursor);
   }
 
   // ===== Legacy API (backward compatible) =====
@@ -98,21 +105,24 @@ export class ChatController {
 
   @Sse("chat/:chatId/stream")
   legacyStreamChat(@Param("chatId") chatId: string): Observable<MessageEvent> {
-    return this.buildStreamObservable(chatId);
+    return this.buildStreamObservable(chatId, 0);
   }
 
   // ===== Shared =====
 
-  private buildStreamObservable(sessionId: string): Observable<MessageEvent> {
+  private buildStreamObservable(
+    sessionId: string,
+    cursorSeq: number,
+  ): Observable<MessageEvent> {
     return new Observable((subscriber) => {
       (async () => {
         try {
-          for await (const content of this.chatService.streamFromSession(
+          for await (const chunk of this.chatService.streamFromSession(
             sessionId,
+            cursorSeq,
           )) {
-            subscriber.next({ data: { content, done: false } });
+            subscriber.next({ data: chunk as ChatStreamChunk });
           }
-          subscriber.next({ data: { content: "", done: true } });
           subscriber.complete();
         } catch (err) {
           subscriber.error(err);
