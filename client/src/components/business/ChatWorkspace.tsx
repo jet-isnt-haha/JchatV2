@@ -10,6 +10,7 @@ import { ChatWorkspaceHeader } from "@/components/business/chat/ChatWorkspaceHea
 import { ChatTimeline } from "@/components/business/chat/ChatTimeline";
 import { MobileBranchTreeDrawer } from "@/components/business/chat/MobileBranchTreeDrawer";
 import { ResearchPanel } from "@/components/business/chat/ResearchPanel";
+import { MobileResearchPanel } from "@/components/business/chat/MobileResearchPanel";
 
 export function ChatWorkspace() {
   const {
@@ -108,6 +109,20 @@ export function ChatWorkspace() {
           isLoading={isBusy}
           forkPointSet={forkPointSet}
           onForkBranch={forkBranch}
+        />
+
+        <MobileResearchPanel
+          deepResearchEnabled={deepResearchEnabled}
+          task={researchTask}
+          plan={researchPlan}
+          selectedPlanItemIds={selectedResearchPlanItemIds}
+          budget={researchBudget}
+          result={researchResult}
+          errorMessage={researchErrorMessage}
+          isAwaitingConfirm={isResearchAwaitingConfirm}
+          isRunning={isResearchRunning}
+          onTogglePlanItem={toggleResearchPlanItem}
+          onConfirmPlan={confirmResearchPlan}
         />
 
         <ChatInput
