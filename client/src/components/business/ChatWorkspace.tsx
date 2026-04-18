@@ -9,6 +9,7 @@ import { BranchTreeDesktopPanel } from "@/components/business/chat/BranchTreeDes
 import { ChatWorkspaceHeader } from "@/components/business/chat/ChatWorkspaceHeader";
 import { ChatTimeline } from "@/components/business/chat/ChatTimeline";
 import { MobileBranchTreeDrawer } from "@/components/business/chat/MobileBranchTreeDrawer";
+import { ResearchPanel } from "@/components/business/chat/ResearchPanel";
 
 export function ChatWorkspace() {
   const {
@@ -17,6 +18,25 @@ export function ChatWorkspace() {
     branchTree,
     messages,
     isLoading,
+    isBusy,
+    deepResearchEnabled,
+    setDeepResearchEnabled,
+    researchTask,
+    researchPlan,
+    selectedResearchPlanItemIds,
+    toggleResearchPlanItem,
+    confirmResearchPlan,
+    researchBranches,
+    researchEvidence,
+    researchEvidenceOverflowCount,
+    researchBudget,
+    researchResult,
+    researchErrorMessage,
+    clearResearchError,
+    researchFailedOrSkippedAttempts,
+    researchActiveSubQuestionTitle,
+    isResearchAwaitingConfirm,
+    isResearchRunning,
     sendMessage,
     forkBranch,
     switchBranch,
@@ -43,7 +63,7 @@ export function ChatWorkspace() {
   }, [branches]);
 
   const handleSwitchBranch = async (branchId: string) => {
-    if (isLoading) {
+    if (isBusy) {
       const err = new DomainError(
         DOMAIN_ERROR_MESSAGES.STREAMING_IN_PROGRESS,
         "STREAMING_IN_PROGRESS",
@@ -64,11 +84,11 @@ export function ChatWorkspace() {
   };
 
   return (
-    <div className="mx-auto flex h-screen max-w-7xl border-x md:grid md:grid-cols-2">
+    <div className="mx-auto flex h-screen max-w-400 border-x md:grid md:grid-cols-[260px_minmax(0,1fr)_360px]">
       <BranchTreeDesktopPanel
         tree={branchTree}
         currentBranchId={chat?.currentBranchId}
-        disabled={isLoading}
+        disabled={isBusy}
         onSelect={handleSwitchBranch}
       />
 
@@ -85,19 +105,47 @@ export function ChatWorkspace() {
         <ChatTimeline
           scrollRef={scrollRef}
           messages={messages}
-          isLoading={isLoading}
+          isLoading={isBusy}
           forkPointSet={forkPointSet}
           onForkBranch={forkBranch}
         />
 
-        <ChatInput onSend={sendMessage} isLoading={isLoading} />
+        <ChatInput
+          onSend={sendMessage}
+          isLoading={isLoading}
+          isInputLocked={isBusy}
+          deepResearchEnabled={deepResearchEnabled}
+          onDeepResearchToggle={(enabled) => {
+            clearResearchError();
+            setDeepResearchEnabled(enabled);
+          }}
+        />
       </div>
+
+      <ResearchPanel
+        deepResearchEnabled={deepResearchEnabled}
+        task={researchTask}
+        plan={researchPlan}
+        selectedPlanItemIds={selectedResearchPlanItemIds}
+        branches={researchBranches}
+        evidence={researchEvidence}
+        evidenceOverflowCount={researchEvidenceOverflowCount}
+        budget={researchBudget}
+        result={researchResult}
+        errorMessage={researchErrorMessage}
+        failedOrSkippedAttempts={researchFailedOrSkippedAttempts}
+        activeSubQuestionTitle={researchActiveSubQuestionTitle}
+        isAwaitingConfirm={isResearchAwaitingConfirm}
+        isRunning={isResearchRunning}
+        onTogglePlanItem={toggleResearchPlanItem}
+        onConfirmPlan={confirmResearchPlan}
+      />
 
       <MobileBranchTreeDrawer
         open={treeOpen}
         tree={branchTree}
         currentBranchId={chat?.currentBranchId}
-        disabled={isLoading}
+        disabled={isBusy}
         onClose={() => setTreeOpen(false)}
         onSelect={handleSwitchBranch}
       />

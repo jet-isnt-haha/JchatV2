@@ -1,12 +1,26 @@
 import type {
   BranchMessagesResponse,
   BranchTreeResponse,
+  ConfirmResearchPlanResponse,
   CreateBranchResponse,
   CreateChatResponse,
+  ResearchPlanResponse,
+  ResearchResultResponse,
+  ResearchSnapshotResponse,
   SendMessageResponse,
+  StartResearchTaskResponse,
   SwitchBranchResponse,
 } from "@jchat/shared";
 import { requestJson } from "@/network/httpClient";
+
+function buildStreamUrl(path: string, cursorSeq?: number) {
+  const params = new URLSearchParams();
+  if (typeof cursorSeq === "number" && cursorSeq > 0) {
+    params.set("cursorSeq", String(cursorSeq));
+  }
+  const query = params.toString();
+  return query ? `${path}?${query}` : path;
+}
 
 export const chatApi = {
   createChat() {
@@ -48,14 +62,59 @@ export const chatApi = {
   },
 
   createStream(chatId: string, sessionId: string, cursorSeq?: number) {
-    const params = new URLSearchParams();
-    if (typeof cursorSeq === "number" && cursorSeq > 0) {
-      params.set("cursorSeq", String(cursorSeq));
-    }
-    const query = params.toString();
-    const url = query
-      ? `/api/chats/${chatId}/stream/${sessionId}?${query}`
-      : `/api/chats/${chatId}/stream/${sessionId}`;
+    const url = buildStreamUrl(`/api/chats/${chatId}/stream/${sessionId}`, cursorSeq);
+    return new EventSource(url);
+  },
+
+  startResearchTask(chatId: string, topic: string) {
+    return requestJson<StartResearchTaskResponse>(
+      `/api/chats/${chatId}/research/tasks`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic }),
+      },
+    );
+  },
+
+  getResearchPlan(chatId: string, taskId: string) {
+    return requestJson<ResearchPlanResponse>(
+      `/api/chats/${chatId}/research/tasks/${taskId}/plan`,
+    );
+  },
+
+  confirmResearchPlan(
+    chatId: string,
+    taskId: string,
+    selectedPlanItemIds: string[],
+  ) {
+    return requestJson<ConfirmResearchPlanResponse>(
+      `/api/chats/${chatId}/research/tasks/${taskId}/plan/confirm`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selectedPlanItemIds }),
+      },
+    );
+  },
+
+  getResearchSnapshot(chatId: string, taskId: string) {
+    return requestJson<ResearchSnapshotResponse>(
+      `/api/chats/${chatId}/research/tasks/${taskId}/snapshot`,
+    );
+  },
+
+  getResearchResult(chatId: string, taskId: string) {
+    return requestJson<ResearchResultResponse>(
+      `/api/chats/${chatId}/research/tasks/${taskId}/result`,
+    );
+  },
+
+  createResearchStream(chatId: string, sessionId: string, cursorSeq?: number) {
+    const url = buildStreamUrl(
+      `/api/chats/${chatId}/research/stream/${sessionId}`,
+      cursorSeq,
+    );
     return new EventSource(url);
   },
 };

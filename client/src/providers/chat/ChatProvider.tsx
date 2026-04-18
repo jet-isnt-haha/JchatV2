@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -13,10 +14,50 @@ import type {
   ChatBranch,
   ChatMessage,
   ChatStreamChunk,
+  DeepResearchTask,
+  ResearchBranchProgress,
+  ResearchBudgetProgress,
+  ResearchEvidenceItem,
+  ResearchPlanItem,
+  ResearchResult,
+  ResearchSnapshotResponse,
+  ResearchStreamEvent,
   CreateChatResponse,
 } from "@jchat/shared";
 import { chatApi } from "@/services/chatApi";
 import { useErrorActions } from "@/providers/error/ErrorProvider";
+
+const RESEARCH_VISIBLE_EVIDENCE_LIMIT = 200;
+
+interface ResearchEvidenceState {
+  visible: ResearchEvidenceItem[];
+  overflowCount: number;
+}
+
+function toVisibleEvidenceState(items: ResearchEvidenceItem[]): ResearchEvidenceState {
+  if (items.length <= RESEARCH_VISIBLE_EVIDENCE_LIMIT) {
+    return {
+      visible: items,
+      overflowCount: 0,
+    };
+  }
+
+  return {
+    visible: items.slice(items.length - RESEARCH_VISIBLE_EVIDENCE_LIMIT),
+    overflowCount: items.length - RESEARCH_VISIBLE_EVIDENCE_LIMIT,
+  };
+}
+
+function getTaskBusy(task: DeepResearchTask | null): boolean {
+  if (!task) {
+    return false;
+  }
+  return (
+    task.status === "waiting_confirm" ||
+    task.status === "running" ||
+    task.status === "finalizing"
+  );
+}
 
 interface ChatContextValue {
   chat: Chat | null;
@@ -24,6 +65,25 @@ interface ChatContextValue {
   branchTree: BranchTreeNode[];
   messages: ChatMessage[];
   isLoading: boolean;
+  isBusy: boolean;
+  deepResearchEnabled: boolean;
+  setDeepResearchEnabled: (enabled: boolean) => void;
+  researchTask: DeepResearchTask | null;
+  researchPlan: ResearchPlanItem[];
+  selectedResearchPlanItemIds: string[];
+  toggleResearchPlanItem: (planItemId: string) => void;
+  confirmResearchPlan: () => Promise<void>;
+  researchBranches: ResearchBranchProgress[];
+  researchEvidence: ResearchEvidenceItem[];
+  researchEvidenceOverflowCount: number;
+  researchBudget: ResearchBudgetProgress | null;
+  researchResult: ResearchResult | null;
+  researchErrorMessage: string;
+  clearResearchError: () => void;
+  researchFailedOrSkippedAttempts: number;
+  researchActiveSubQuestionTitle?: string;
+  isResearchAwaitingConfirm: boolean;
+  isResearchRunning: boolean;
   sendMessage: (content: string) => Promise<void>;
   forkBranch: (baseMessageId: string, name?: string) => Promise<void>;
   switchBranch: (branchId: string) => Promise<void>;
@@ -38,10 +98,41 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
 
+  const [deepResearchEnabled, setDeepResearchEnabledState] = useState(false);
+  const [researchTask, setResearchTask] = useState<DeepResearchTask | null>(null);
+  const [researchPlan, setResearchPlan] = useState<ResearchPlanItem[]>([]);
+  const [selectedResearchPlanItemIds, setSelectedResearchPlanItemIds] = useState<
+    string[]
+  >([]);
+  const [researchBranches, setResearchBranches] = useState<
+    ResearchBranchProgress[]
+  >([]);
+  const [researchEvidenceState, setResearchEvidenceState] =
+    useState<ResearchEvidenceState>({
+      visible: [],
+      overflowCount: 0,
+    });
+  const [researchBudget, setResearchBudget] =
+    useState<ResearchBudgetProgress | null>(null);
+  const [researchResult, setResearchResult] = useState<ResearchResult | null>(
+    null,
+  );
+  const [researchErrorMessage, setResearchErrorMessage] = useState("");
+  const [researchFailedOrSkippedAttempts, setResearchFailedOrSkippedAttempts] =
+    useState(0);
+  const [researchActiveSubQuestionTitle, setResearchActiveSubQuestionTitle] =
+    useState<string>();
+
   const { showError } = useErrorActions();
 
   const chatRef = useRef(chat);
   chatRef.current = chat;
+
+  const researchTaskRef = useRef(researchTask);
+  researchTaskRef.current = researchTask;
+
+  const researchStreamRef = useRef<EventSource | null>(null);
+  const insertedResearchReportTaskIdsRef = useRef(new Set<string>());
 
   const initChat = useCallback(async (): Promise<CreateChatResponse> => {
     const data = await chatApi.createChat();
@@ -60,6 +151,31 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       },
     ]);
     return data;
+  }, []);
+
+  const closeResearchStream = useCallback(() => {
+    if (researchStreamRef.current) {
+      researchStreamRef.current.close();
+      researchStreamRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      closeResearchStream();
+    };
+  }, [closeResearchStream]);
+
+  const resetResearchPanelState = useCallback(() => {
+    setResearchPlan([]);
+    setSelectedResearchPlanItemIds([]);
+    setResearchBranches([]);
+    setResearchEvidenceState({ visible: [], overflowCount: 0 });
+    setResearchBudget(null);
+    setResearchResult(null);
+    setResearchFailedOrSkippedAttempts(0);
+    setResearchActiveSubQuestionTitle(undefined);
+    setResearchErrorMessage("");
   }, []);
 
   const loadBranchTree = useCallback(async (chatId: string) => {
@@ -189,9 +305,313 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const appendResearchReportToTimeline = useCallback(
+    (taskId: string, result: ResearchResult) => {
+      if (insertedResearchReportTaskIdsRef.current.has(taskId)) {
+        return;
+      }
+
+      const currentChat = chatRef.current;
+      if (!currentChat) {
+        return;
+      }
+
+      insertedResearchReportTaskIdsRef.current.add(taskId);
+
+      setMessages((prev) => {
+        const parentId = prev.length > 0 ? prev[prev.length - 1].id : null;
+        const reportMessage: ChatMessage = {
+          id: `research-report-${taskId}`,
+          role: "assistant",
+          content: result.reportMarkdown,
+          parentId,
+          branchId: currentChat.currentBranchId,
+          chatId: currentChat.id,
+          createdAt: Date.now(),
+        };
+        return [...prev, reportMessage];
+      });
+    },
+    [],
+  );
+
+  const applyResearchEvent = useCallback(
+    (event: ResearchStreamEvent) => {
+      const payload = event.payload;
+
+      if (payload?.task) {
+        setResearchTask(payload.task);
+      }
+
+      if (payload?.budget) {
+        setResearchBudget(payload.budget);
+      }
+
+      if (typeof payload?.message === "string") {
+        setResearchActiveSubQuestionTitle(payload.message);
+      }
+
+      if (payload?.branch) {
+        setResearchBranches((prev) => {
+          const idx = prev.findIndex((item) => item.id === payload.branch!.id);
+          if (idx === -1) {
+            return [...prev, payload.branch!];
+          }
+          const next = [...prev];
+          next[idx] = payload.branch!;
+          return next;
+        });
+      }
+
+      if (payload?.evidence) {
+        setResearchEvidenceState((prev) => {
+          const nextVisible = [...prev.visible, payload.evidence!];
+          if (nextVisible.length <= RESEARCH_VISIBLE_EVIDENCE_LIMIT) {
+            return {
+              visible: nextVisible,
+              overflowCount: prev.overflowCount,
+            };
+          }
+
+          return {
+            visible: nextVisible.slice(
+              nextVisible.length - RESEARCH_VISIBLE_EVIDENCE_LIMIT,
+            ),
+            overflowCount: prev.overflowCount + 1,
+          };
+        });
+      }
+
+      if (event.eventType === "report_ready") {
+        if (payload?.result) {
+          setResearchResult(payload.result);
+        }
+        if (payload?.task) {
+          setResearchTask(payload.task);
+        }
+        if (payload?.result && payload?.task) {
+          appendResearchReportToTimeline(payload.task.id, payload.result);
+        }
+        setResearchErrorMessage("");
+        setDeepResearchEnabledState(false);
+      }
+
+      if (event.eventType === "task_failed") {
+        if (payload?.task) {
+          setResearchTask(payload.task);
+        }
+        setResearchBranches([]);
+        setResearchEvidenceState({ visible: [], overflowCount: 0 });
+        setResearchBudget(null);
+        setResearchResult(null);
+        setResearchActiveSubQuestionTitle(undefined);
+        setResearchFailedOrSkippedAttempts(0);
+        setResearchErrorMessage(
+          payload?.message ??
+            "深度研究失败，请检查 Tavily key、网络状态并稍后重试。",
+        );
+        setDeepResearchEnabledState(false);
+      }
+    },
+    [appendResearchReportToTimeline],
+  );
+
+  const recoverResearchFromSnapshot = useCallback(
+    async (chatId: string, taskId: string) => {
+      const snapshot: ResearchSnapshotResponse = await chatApi.getResearchSnapshot(
+        chatId,
+        taskId,
+      );
+
+      setResearchTask(snapshot.task);
+      setResearchBranches(snapshot.branches);
+      setResearchEvidenceState(toVisibleEvidenceState(snapshot.evidence));
+      setResearchBudget(snapshot.budget);
+      setResearchFailedOrSkippedAttempts(snapshot.failedOrSkippedAttempts);
+      setResearchActiveSubQuestionTitle(snapshot.activeSubQuestionTitle);
+
+      if (snapshot.task.status === "completed") {
+        const { result } = await chatApi.getResearchResult(chatId, taskId);
+        setResearchResult(result);
+        appendResearchReportToTimeline(taskId, result);
+        setDeepResearchEnabledState(false);
+      }
+
+      if (snapshot.task.status === "failed") {
+        setResearchBranches([]);
+        setResearchEvidenceState({ visible: [], overflowCount: 0 });
+        setResearchBudget(null);
+        setResearchResult(null);
+        setResearchErrorMessage(
+          snapshot.task.errorMessage ??
+            "深度研究失败，请检查 Tavily key、网络状态并稍后重试。",
+        );
+        setDeepResearchEnabledState(false);
+      }
+    },
+    [appendResearchReportToTimeline],
+  );
+
+  const receiveResearchStream = useCallback(
+    (chatId: string, taskId: string, sessionId: string): Promise<void> => {
+      const reconnectDeadline = Date.now() + 2 * 60 * 1000;
+      let lastSeq = 0;
+      let reconnectCount = 0;
+
+      const connect = (cursorSeq: number): Promise<void> =>
+        new Promise((resolve, reject) => {
+          const source = chatApi.createResearchStream(chatId, sessionId, cursorSeq);
+          researchStreamRef.current = source;
+
+          source.onmessage = (event) => {
+            const streamEvent: ResearchStreamEvent = JSON.parse(event.data as string);
+
+            if (streamEvent.seq <= lastSeq) {
+              return;
+            }
+            lastSeq = streamEvent.seq;
+            applyResearchEvent(streamEvent);
+
+            if (streamEvent.done) {
+              source.close();
+              if (researchStreamRef.current === source) {
+                researchStreamRef.current = null;
+              }
+              resolve();
+            }
+          };
+
+          source.onerror = () => {
+            source.close();
+            if (researchStreamRef.current === source) {
+              researchStreamRef.current = null;
+            }
+            reject(new Error("RESEARCH_SSE_CONNECTION_ERROR"));
+          };
+        });
+
+      return new Promise((resolve, reject) => {
+        const attempt = async () => {
+          try {
+            await connect(lastSeq);
+            resolve();
+          } catch (error) {
+            if (Date.now() >= reconnectDeadline) {
+              try {
+                await recoverResearchFromSnapshot(chatId, taskId);
+                resolve();
+              } catch (snapshotError) {
+                reject(snapshotError);
+              }
+              return;
+            }
+
+            reconnectCount += 1;
+            const delay = Math.min(2000, 200 * 2 ** Math.min(reconnectCount, 4));
+            window.setTimeout(attempt, delay);
+          }
+        };
+
+        void attempt();
+      });
+    },
+    [applyResearchEvent, recoverResearchFromSnapshot],
+  );
+
+  const startDeepResearch = useCallback(
+    async (topic: string) => {
+      if (getTaskBusy(researchTaskRef.current)) {
+        setResearchErrorMessage("当前已有深度研究任务进行中，请等待其完成。");
+        return;
+      }
+
+      try {
+        closeResearchStream();
+        resetResearchPanelState();
+
+        let currentChat = chatRef.current;
+        if (!currentChat) {
+          const { chat: createdChat } = await initChat();
+          currentChat = createdChat;
+        }
+
+        const { task, streamSessionId } = await chatApi.startResearchTask(
+          currentChat.id,
+          topic,
+        );
+        setResearchTask(task);
+
+        const plan = await chatApi.getResearchPlan(currentChat.id, task.id);
+        setResearchPlan(plan.items);
+        setSelectedResearchPlanItemIds(
+          plan.items.filter((item) => item.selected).map((item) => item.id),
+        );
+
+        void receiveResearchStream(currentChat.id, task.id, streamSessionId);
+      } catch (err) {
+        showError(err);
+        setResearchErrorMessage("深度研究启动失败，请重试。");
+      }
+    },
+    [
+      closeResearchStream,
+      initChat,
+      receiveResearchStream,
+      resetResearchPanelState,
+      showError,
+    ],
+  );
+
+  const toggleResearchPlanItem = useCallback((planItemId: string) => {
+    setSelectedResearchPlanItemIds((prev) => {
+      if (prev.includes(planItemId)) {
+        return prev.filter((id) => id !== planItemId);
+      }
+      return [...prev, planItemId];
+    });
+  }, []);
+
+  const confirmResearchPlan = useCallback(async () => {
+    const currentChat = chatRef.current;
+    const task = researchTaskRef.current;
+    if (!currentChat || !task) {
+      return;
+    }
+
+    try {
+      const { task: confirmedTask } = await chatApi.confirmResearchPlan(
+        currentChat.id,
+        task.id,
+        selectedResearchPlanItemIds,
+      );
+      setResearchTask(confirmedTask);
+    } catch (err) {
+      showError(err);
+      setResearchErrorMessage("研究计划确认失败，请检查勾选项后重试。");
+    }
+  }, [selectedResearchPlanItemIds, showError]);
+
+  const clearResearchError = useCallback(() => {
+    setResearchErrorMessage("");
+  }, []);
+
+  const setDeepResearchEnabled = useCallback((enabled: boolean) => {
+    setDeepResearchEnabledState(enabled);
+  }, []);
+
   const sendMessage = useCallback(
     async (content: string) => {
-      if (isLoading) return;
+      const task = researchTaskRef.current;
+      const researchBusy = getTaskBusy(task);
+      if (isLoading || researchBusy) {
+        return;
+      }
+
+      if (deepResearchEnabled) {
+        await startDeepResearch(content);
+        return;
+      }
+
       setIsLoading(true);
 
       try {
@@ -237,7 +657,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         setIsLoading(false);
       }
     },
-    [initChat, isLoading, receiveStream, showError],
+    [
+      deepResearchEnabled,
+      initChat,
+      isLoading,
+      receiveStream,
+      showError,
+      startDeepResearch,
+    ],
   );
 
   const forkBranch = useCallback(
@@ -269,6 +696,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const currentChat = chatRef.current;
       if (!currentChat) return;
 
+      if (isLoading || getTaskBusy(researchTaskRef.current)) {
+        return;
+      }
+
       const { chat: updatedChat } = await chatApi.switchBranch(
         currentChat.id,
         branchId,
@@ -278,8 +709,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       await loadBranchTree(currentChat.id);
       await loadBranchMessages(currentChat.id, branchId);
     },
-    [loadBranchMessages, loadBranchTree],
+    [isLoading, loadBranchMessages, loadBranchTree],
   );
+
+  const isResearchAwaitingConfirm = researchTask?.status === "waiting_confirm";
+  const isResearchRunning =
+    researchTask?.status === "running" || researchTask?.status === "finalizing";
+  const isBusy = isLoading || isResearchAwaitingConfirm || isResearchRunning;
 
   const value = useMemo<ChatContextValue>(
     () => ({
@@ -288,6 +724,25 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       branchTree,
       messages,
       isLoading,
+      isBusy,
+      deepResearchEnabled,
+      setDeepResearchEnabled,
+      researchTask,
+      researchPlan,
+      selectedResearchPlanItemIds,
+      toggleResearchPlanItem,
+      confirmResearchPlan,
+      researchBranches,
+      researchEvidence: researchEvidenceState.visible,
+      researchEvidenceOverflowCount: researchEvidenceState.overflowCount,
+      researchBudget,
+      researchResult,
+      researchErrorMessage,
+      clearResearchError,
+      researchFailedOrSkippedAttempts,
+      researchActiveSubQuestionTitle,
+      isResearchAwaitingConfirm,
+      isResearchRunning,
       sendMessage,
       forkBranch,
       switchBranch,
@@ -298,6 +753,24 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       branchTree,
       messages,
       isLoading,
+      isBusy,
+      deepResearchEnabled,
+      setDeepResearchEnabled,
+      researchTask,
+      researchPlan,
+      selectedResearchPlanItemIds,
+      toggleResearchPlanItem,
+      confirmResearchPlan,
+      researchBranches,
+      researchEvidenceState,
+      researchBudget,
+      researchResult,
+      researchErrorMessage,
+      clearResearchError,
+      researchFailedOrSkippedAttempts,
+      researchActiveSubQuestionTitle,
+      isResearchAwaitingConfirm,
+      isResearchRunning,
       sendMessage,
       forkBranch,
       switchBranch,
