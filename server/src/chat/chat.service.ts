@@ -105,6 +105,7 @@ export class ChatService {
   // P0 research runtime state is kept in-memory (single-instance scope).
   private researchTasks = new Map<string, ResearchTaskState>();
   private researchStreamSessions = new Map<string, ResearchStreamSession>();
+  private researchContextByChat = new Map<string, string>();
 
   constructor(
     private configService: ConfigService,
@@ -325,15 +326,31 @@ export class ChatService {
       leafMessageId: assistantMessage.id,
     });
 
-    // 获取消息链用于上下文构建和流式输出，包含用户消息和模型消息
+    // 获取消息链用于上下文构建和流式输出，包含用户消息和模型消息。
+    // 如果当前 chat 有最近一次研究报告，则将其作为附加上下文注入本轮推理。
     const chain = this.repository.getAncestorChain(userMessage.id);
+    const researchContext = this.researchContextByChat.get(chatId);
+    const chainWithContext = researchContext
+      ? [
+          {
+            id: `research-context-${chatId}`,
+            role: "assistant" as const,
+            content: `以下是本会话的研究上下文，请优先参考：\n${researchContext}`,
+            parentId: null,
+            branchId,
+            chatId,
+            createdAt: now - 1,
+          },
+          ...chain,
+        ]
+      : chain;
 
     const sessionId = randomUUID();
     const nowTs = Date.now();
     this.streamSessions.set(sessionId, {
       streamId: sessionId,
       messageId: assistantMessage.id,
-      messages: chain,
+      messages: chainWithContext,
       status: "pending",
       seq: 0,
       fullContent: "",
@@ -930,6 +947,10 @@ export class ChatService {
 
     state.activeSubQuestionTitle = undefined;
     state.result = this.buildResearchResult(state);
+    this.researchContextByChat.set(
+      state.task.chatId,
+      this.truncateSnippet(state.result.reportMarkdown, 6000),
+    );
     state.task = {
       ...state.task,
       status: "completed",
