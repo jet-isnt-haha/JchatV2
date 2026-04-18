@@ -1,4 +1,10 @@
-import { GoneException, Injectable, NotFoundException } from "@nestjs/common";
+import {
+  BadRequestException,
+  ConflictException,
+  GoneException,
+  Injectable,
+  NotFoundException,
+} from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
@@ -9,6 +15,18 @@ import type {
   ChatStreamChunk,
   BranchTreeResponse,
   BranchTreeNode,
+  DeepResearchTask,
+  ResearchPlanItem,
+  ResearchBranchProgress,
+  ResearchEvidenceItem,
+  ResearchBudgetProgress,
+  ResearchResult,
+  StartResearchTaskResponse,
+  ResearchPlanResponse,
+  ConfirmResearchPlanResponse,
+  ResearchSnapshotResponse,
+  ResearchResultResponse,
+  ResearchStreamEvent,
 } from "@jchat/shared";
 import { randomUUID } from "crypto";
 import { InMemoryChatRepository } from "./chat.repository";
@@ -28,6 +46,28 @@ interface StreamSession {
   started: boolean;
 }
 
+interface ResearchTaskState {
+  task: DeepResearchTask;
+  plan: ResearchPlanItem[];
+  branches: ResearchBranchProgress[];
+  evidence: ResearchEvidenceItem[];
+  budget: ResearchBudgetProgress;
+  result?: ResearchResult;
+  streamSessionId: string;
+  failedOrSkippedAttempts: number;
+  activeSubQuestionTitle?: string;
+}
+
+interface ResearchStreamSession {
+  streamId: string;
+  taskId: string;
+  seq: number;
+  events: ResearchStreamEvent[];
+  listeners: Set<(event: ResearchStreamEvent) => void>;
+  expireAt: number;
+  closed: boolean;
+}
+
 @Injectable()
 export class ChatService {
   private static readonly STREAM_TTL_MS = 2 * 60 * 1000;
@@ -36,6 +76,10 @@ export class ChatService {
 
   private llm: ChatOpenAI;
   private streamSessions = new Map<string, StreamSession>();
+
+  // P0 research runtime state is kept in-memory (single-instance scope).
+  private researchTasks = new Map<string, ResearchTaskState>();
+  private researchStreamSessions = new Map<string, ResearchStreamSession>();
 
   constructor(
     private configService: ConfigService,
@@ -356,7 +400,353 @@ export class ChatService {
       }
     }
   }
+  // ===== Deep Research (Skeleton) =====
 
+  startResearchTask(chatId: string, topic: string): StartResearchTaskResponse {
+    this.getChat(chatId);
+    this.cleanupExpiredResearchSessions();
+
+    const normalizedTopic = topic.trim();
+    if (!normalizedTopic) {
+      throw new BadRequestException("Topic is required");
+    }
+
+    this.assertNoRunningResearchTask(chatId);
+
+    const now = Date.now();
+    const taskId = randomUUID();
+    const streamSessionId = randomUUID();
+
+    const task: DeepResearchTask = {
+      id: taskId,
+      chatId,
+      topic: normalizedTopic,
+      status: "waiting_confirm",
+      createdAt: now,
+    };
+
+    // P0 uses deterministic placeholder decomposition before real agent planner is wired.
+    const plan: ResearchPlanItem[] = [
+      {
+        id: randomUUID(),
+        title: `${normalizedTopic} 的核心概念与边界`,
+        selected: true,
+      },
+      {
+        id: randomUUID(),
+        title: `${normalizedTopic} 的现状与关键证据`,
+        selected: true,
+      },
+      {
+        id: randomUUID(),
+        title: `${normalizedTopic} 的争议与风险`,
+        selected: true,
+      },
+    ];
+
+    const budget: ResearchBudgetProgress = {
+      maxRounds: 5,
+      currentRound: 0,
+      maxDurationMs: 10 * 60 * 1000,
+      elapsedMs: 0,
+      extensionRoundUsed: false,
+    };
+
+    this.researchTasks.set(taskId, {
+      task,
+      plan,
+      branches: [],
+      evidence: [],
+      budget,
+      streamSessionId,
+      failedOrSkippedAttempts: 0,
+    });
+
+    const streamSession: ResearchStreamSession = {
+      streamId: streamSessionId,
+      taskId,
+      seq: 0,
+      events: [],
+      listeners: new Set(),
+      expireAt: now + ChatService.STREAM_TTL_MS,
+      closed: false,
+    };
+    this.researchStreamSessions.set(streamSessionId, streamSession);
+
+    // Emit first event so UI can render the plan confirmation step immediately.
+    this.appendResearchEvent(streamSession, {
+      eventType: "plan_ready",
+      payload: { task },
+      done: false,
+    });
+
+    return { task, streamSessionId };
+  }
+
+  getResearchPlan(chatId: string, taskId: string): ResearchPlanResponse {
+    const state = this.getResearchTaskOrThrow(chatId, taskId);
+    return {
+      taskId,
+      items: state.plan,
+      maxConcurrentBranches: 3,
+      defaultAllSelected: true,
+    };
+  }
+
+  confirmResearchPlan(
+    chatId: string,
+    taskId: string,
+    selectedPlanItemIds: string[],
+  ): ConfirmResearchPlanResponse {
+    const state = this.getResearchTaskOrThrow(chatId, taskId);
+    const selectedSet = new Set(selectedPlanItemIds);
+
+    if (selectedSet.size === 0) {
+      throw new BadRequestException("At least one plan item must be selected");
+    }
+
+    const validIds = new Set(state.plan.map((item) => item.id));
+    for (const id of selectedSet) {
+      if (!validIds.has(id)) {
+        throw new BadRequestException("Selected plan item id is invalid");
+      }
+    }
+
+    state.plan = state.plan.map((item) => ({
+      ...item,
+      selected: selectedSet.has(item.id),
+    }));
+
+    // Selected plan items become branch runtime entries; first one starts as active.
+    const selectedItems = state.plan.filter((item) => item.selected);
+    state.branches = selectedItems.map((item, index) => ({
+      id: randomUUID(),
+      planItemId: item.id,
+      title: item.title,
+      status: index === 0 ? "retrieving" : "pending",
+      queueIndex: index,
+      isActive: index === 0,
+    }));
+
+    state.activeSubQuestionTitle = state.branches[0]?.title;
+    state.budget = {
+      ...state.budget,
+      currentRound: 1,
+      elapsedMs: 0,
+      etaMs: state.budget.maxDurationMs,
+    };
+
+    state.task = {
+      ...state.task,
+      status: "running",
+      startedAt: Date.now(),
+    };
+
+    const streamSession = this.getResearchStreamSessionOrThrow(
+      state.streamSessionId,
+    );
+
+    // Send initial lifecycle and progress events for right-panel streaming UI.
+    this.appendResearchEvent(streamSession, {
+      eventType: "plan_confirmed",
+      payload: { task: state.task },
+      done: false,
+    });
+
+    this.appendResearchEvent(streamSession, {
+      eventType: "task_started",
+      payload: {
+        task: state.task,
+        budget: state.budget,
+      },
+      done: false,
+    });
+
+    for (const branch of state.branches.slice(0, 3)) {
+      this.appendResearchEvent(streamSession, {
+        eventType: "branch_status_changed",
+        payload: { branch },
+        done: false,
+      });
+    }
+
+    this.appendResearchEvent(streamSession, {
+      eventType: "budget_progress",
+      payload: { budget: state.budget },
+      done: false,
+    });
+
+    return { task: state.task };
+  }
+
+  getResearchSnapshot(
+    chatId: string,
+    taskId: string,
+  ): ResearchSnapshotResponse {
+    const state = this.getResearchTaskOrThrow(chatId, taskId);
+    return {
+      task: state.task,
+      branches: state.branches,
+      evidence: state.evidence,
+      budget: state.budget,
+      activeSubQuestionTitle: state.activeSubQuestionTitle,
+      failedOrSkippedAttempts: state.failedOrSkippedAttempts,
+    };
+  }
+
+  getResearchResult(chatId: string, taskId: string): ResearchResultResponse {
+    const state = this.getResearchTaskOrThrow(chatId, taskId);
+    if (!state.result) {
+      throw new NotFoundException("Research result not ready");
+    }
+    return {
+      taskId,
+      result: state.result,
+    };
+  }
+
+  async *streamResearchFromSession(
+    sessionId: string,
+    cursorSeq = 0,
+  ): AsyncGenerator<ResearchStreamEvent> {
+    this.cleanupExpiredResearchSessions();
+
+    const session = this.getResearchStreamSessionOrThrow(sessionId);
+    this.touchResearchSession(session);
+
+    let localCursor = Math.max(0, cursorSeq);
+    // Replay buffered events first, then wait for live events.
+    const buffered = session.events.filter((event) => event.seq > localCursor);
+    for (const event of buffered) {
+      localCursor = event.seq;
+      yield event;
+      if (event.done) {
+        return;
+      }
+    }
+
+    if (session.closed) {
+      return;
+    }
+
+    const queue: ResearchStreamEvent[] = [];
+    let notify: (() => void) | null = null;
+
+    const listener = (event: ResearchStreamEvent) => {
+      if (event.seq > localCursor) {
+        queue.push(event);
+        if (notify) {
+          notify();
+          notify = null;
+        }
+      }
+    };
+
+    session.listeners.add(listener);
+
+    try {
+      while (true) {
+        if (queue.length === 0) {
+          await new Promise<void>((resolve) => {
+            notify = resolve;
+          });
+        }
+
+        while (queue.length > 0) {
+          const event = queue.shift()!;
+          localCursor = event.seq;
+          yield event;
+          if (event.done) {
+            return;
+          }
+        }
+      }
+    } finally {
+      session.listeners.delete(listener);
+      if (notify) {
+        notify();
+      }
+    }
+  }
+
+  private getResearchTaskOrThrow(
+    chatId: string,
+    taskId: string,
+  ): ResearchTaskState {
+    const state = this.researchTasks.get(taskId);
+    if (!state || state.task.chatId !== chatId) {
+      throw new NotFoundException("Research task not found");
+    }
+    return state;
+  }
+
+  private getResearchStreamSessionOrThrow(
+    sessionId: string,
+  ): ResearchStreamSession {
+    const session = this.researchStreamSessions.get(sessionId);
+    if (!session) {
+      throw new NotFoundException("Research stream session not found");
+    }
+
+    if (session.expireAt <= Date.now()) {
+      this.researchStreamSessions.delete(sessionId);
+      throw new GoneException("Research stream session expired");
+    }
+
+    return session;
+  }
+
+  private appendResearchEvent(
+    session: ResearchStreamSession,
+    event: Omit<ResearchStreamEvent, "streamId" | "seq">,
+  ): ResearchStreamEvent {
+    // Sequence is assigned only on server side to keep replay ordering canonical.
+    session.seq += 1;
+    const nextEvent: ResearchStreamEvent = {
+      streamId: session.streamId,
+      seq: session.seq,
+      ...event,
+    };
+
+    session.events.push(nextEvent);
+    if (nextEvent.done) {
+      session.closed = true;
+    }
+
+    this.touchResearchSession(session);
+
+    for (const listener of session.listeners) {
+      listener(nextEvent);
+    }
+
+    return nextEvent;
+  }
+
+  private touchResearchSession(session: ResearchStreamSession): void {
+    session.expireAt = Date.now() + ChatService.STREAM_TTL_MS;
+  }
+
+  private cleanupExpiredResearchSessions(): void {
+    const now = Date.now();
+    for (const [id, session] of this.researchStreamSessions.entries()) {
+      if (session.expireAt <= now) {
+        // Stream payloads are temporary; eviction follows the same TTL window as chat SSE.
+        this.researchStreamSessions.delete(id);
+      }
+    }
+  }
+
+  private assertNoRunningResearchTask(chatId: string): void {
+    for (const state of this.researchTasks.values()) {
+      if (
+        state.task.chatId === chatId &&
+        state.task.status !== "completed" &&
+        state.task.status !== "failed"
+      ) {
+        throw new ConflictException("A research task is already running");
+      }
+    }
+  }
   // ===== Legacy Compatibility =====
 
   createLegacySession(

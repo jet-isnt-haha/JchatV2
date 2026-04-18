@@ -25,6 +25,14 @@ import type {
   LegacyChatRequest,
   LegacyChatStartResponse,
   ChatStreamChunk,
+  StartResearchTaskRequest,
+  StartResearchTaskResponse,
+  ResearchPlanResponse,
+  ConfirmResearchPlanRequest,
+  ConfirmResearchPlanResponse,
+  ResearchSnapshotResponse,
+  ResearchResultResponse,
+  ResearchStreamEvent,
 } from "@jchat/shared";
 
 @Controller("api")
@@ -88,11 +96,64 @@ export class ChatController {
     @Param("sessionId") sessionId: string,
     @Query("cursorSeq") cursorSeq?: string,
   ): Observable<MessageEvent> {
-    const parsedCursor = Number.parseInt(cursorSeq ?? "0", 10);
-    const safeCursor = Number.isNaN(parsedCursor)
-      ? 0
-      : Math.max(parsedCursor, 0);
+    const safeCursor = this.parseCursorSeq(cursorSeq);
     return this.buildStreamObservable(sessionId, safeCursor);
+  }
+
+  // ===== Deep Research API =====
+
+  @Post("chats/:chatId/research/tasks")
+  startResearchTask(
+    @Param("chatId") chatId: string,
+    @Body() body: StartResearchTaskRequest,
+  ): StartResearchTaskResponse {
+    return this.chatService.startResearchTask(chatId, body.topic);
+  }
+
+  @Get("chats/:chatId/research/tasks/:taskId/plan")
+  getResearchPlan(
+    @Param("chatId") chatId: string,
+    @Param("taskId") taskId: string,
+  ): ResearchPlanResponse {
+    return this.chatService.getResearchPlan(chatId, taskId);
+  }
+
+  @Post("chats/:chatId/research/tasks/:taskId/plan/confirm")
+  confirmResearchPlan(
+    @Param("chatId") chatId: string,
+    @Param("taskId") taskId: string,
+    @Body() body: ConfirmResearchPlanRequest,
+  ): ConfirmResearchPlanResponse {
+    return this.chatService.confirmResearchPlan(
+      chatId,
+      taskId,
+      body.selectedPlanItemIds,
+    );
+  }
+
+  @Get("chats/:chatId/research/tasks/:taskId/snapshot")
+  getResearchSnapshot(
+    @Param("chatId") chatId: string,
+    @Param("taskId") taskId: string,
+  ): ResearchSnapshotResponse {
+    return this.chatService.getResearchSnapshot(chatId, taskId);
+  }
+
+  @Get("chats/:chatId/research/tasks/:taskId/result")
+  getResearchResult(
+    @Param("chatId") chatId: string,
+    @Param("taskId") taskId: string,
+  ): ResearchResultResponse {
+    return this.chatService.getResearchResult(chatId, taskId);
+  }
+
+  @Sse("chats/:chatId/research/stream/:sessionId")
+  streamResearch(
+    @Param("sessionId") sessionId: string,
+    @Query("cursorSeq") cursorSeq?: string,
+  ): Observable<MessageEvent> {
+    const safeCursor = this.parseCursorSeq(cursorSeq);
+    return this.buildResearchStreamObservable(sessionId, safeCursor);
   }
 
   // ===== Legacy API (backward compatible) =====
@@ -129,5 +190,33 @@ export class ChatController {
         }
       })();
     });
+  }
+
+  private buildResearchStreamObservable(
+    sessionId: string,
+    cursorSeq: number,
+  ): Observable<MessageEvent> {
+    // Reuse the same SSE replay model as chat stream: client reconnects with cursorSeq.
+    return new Observable((subscriber) => {
+      (async () => {
+        try {
+          for await (const event of this.chatService.streamResearchFromSession(
+            sessionId,
+            cursorSeq,
+          )) {
+            subscriber.next({ data: event as ResearchStreamEvent });
+          }
+          subscriber.complete();
+        } catch (err) {
+          subscriber.error(err);
+        }
+      })();
+    });
+  }
+
+  private parseCursorSeq(cursorSeq?: string): number {
+    // Any invalid/negative cursor is normalized to 0 for safe replay behavior.
+    const parsedCursor = Number.parseInt(cursorSeq ?? "0", 10);
+    return Number.isNaN(parsedCursor) ? 0 : Math.max(parsedCursor, 0);
   }
 }
