@@ -12,6 +12,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { GitBranch } from "lucide-react";
 import type { BranchTreeNode } from "@jchat/shared";
+import { useTheme } from "@/hooks/useTheme";
 
 interface BranchTreePanelProps {
   tree: BranchTreeNode[];
@@ -47,7 +48,7 @@ function flattenTree(tree: BranchTreeNode[]) {
           ? "1px solid var(--color-primary)"
           : "1px solid var(--color-border)",
         background: item.isCurrent
-          ? "color-mix(in oklch, var(--color-primary) 12%, white 88%)"
+          ? "color-mix(in oklch, var(--color-primary) 12%, var(--color-card) 88%)"
           : "var(--color-card)",
         color: "var(--color-foreground)",
         padding: "8px 10px",
@@ -86,6 +87,7 @@ export function BranchTreePanel({
   disabled,
   onSelect,
 }: BranchTreePanelProps) {
+  const { theme } = useTheme();
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance | null>(
     null,
   );
@@ -140,6 +142,7 @@ export function BranchTreePanel({
         zoomOnScroll
         zoomOnPinch
         zoomOnDoubleClick={false}
+        colorMode={theme}
         proOptions={{ hideAttribution: true }}
       >
         <Background gap={16} size={1} />
