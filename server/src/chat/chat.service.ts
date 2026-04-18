@@ -781,7 +781,13 @@ export class ChatService {
       return 0;
     }
 
-    const active = candidates.slice(0, ChatService.RESEARCH_MAX_CONCURRENT_BRANCHES);
+    const active: ResearchBranchProgress[] = [];
+    const maxConcurrent = ChatService.RESEARCH_MAX_CONCURRENT_BRANCHES;
+    const startOffset =
+      ((state.budget.currentRound - 1) * maxConcurrent) % candidates.length;
+    for (let i = 0; i < Math.min(maxConcurrent, candidates.length); i += 1) {
+      active.push(candidates[(startOffset + i) % candidates.length]);
+    }
     const activeIds = new Set(active.map((branch) => branch.id));
 
     for (const branch of state.branches) {
@@ -826,9 +832,31 @@ export class ChatService {
     this.setResearchBranchStatus(state, streamSession, branch.id, "retrieving", true);
 
     const query = this.buildSearchQuery(state.task.topic, branch.title, state.budget.currentRound);
-    const searchResults = await this.searchWithRetry(query, 6);
+    const searchResults = await this.searchWithRetry(state, query, 6);
 
     this.setResearchBranchStatus(state, streamSession, branch.id, "reading", true);
+
+    if (searchResults.length === 0) {
+      state.failedOrSkippedAttempts += 1;
+      const emptyEvidence: ResearchEvidenceItem = {
+        id: randomUUID(),
+        planItemId: branch.planItemId,
+        title: `${branch.title}（检索结果为空）`,
+        url: "",
+        domain: "unknown",
+        snippet: "本轮检索未获得可用网页结果。",
+        accepted: false,
+        rejectReason: "检索结果为空",
+        isWhitelistSource: false,
+        createdAt: Date.now(),
+      };
+      state.evidence.push(emptyEvidence);
+      this.appendResearchEvent(streamSession, {
+        eventType: "evidence_rejected",
+        payload: { evidence: emptyEvidence },
+        done: false,
+      });
+    }
 
     let acceptedAdded = 0;
     for (const item of searchResults) {
@@ -894,6 +922,7 @@ export class ChatService {
   }
 
   private async searchWithRetry(
+    state: ResearchTaskState,
     query: string,
     maxResults: number,
   ): Promise<ResearchSearchResult[]> {
@@ -908,6 +937,7 @@ export class ChatService {
         return await this.researchSearchAdapter.search(query, maxResults);
       } catch (error) {
         lastError = error;
+        state.failedOrSkippedAttempts += 1;
         if (attempt >= ChatService.RESEARCH_TAVILY_MAX_RETRIES) {
           break;
         }
@@ -1089,9 +1119,16 @@ export class ChatService {
     report.push("## 参考来源");
     for (const footnote of footnotes) {
       report.push(`<a id="ref-${footnote.index}"></a>${footnote.index}. [${footnote.title}](${footnote.url})  `);
-      report.push(
-        `摘录：${this.truncateSnippet(footnote.snippet, 200)}  `,
-      );
+      if (footnote.snippet.length > 200) {
+        report.push(
+          `<details><summary>摘录：${this.truncateSnippet(
+            footnote.snippet,
+            200,
+          )}</summary>${footnote.snippet}</details>  `,
+        );
+      } else {
+        report.push(`摘录：${footnote.snippet}  `);
+      }
       report.push(
         `来源类型：${footnote.isWhitelistSource ? "白名单来源" : "非白名单来源（已降权）"}`,
       );
@@ -1134,7 +1171,7 @@ export class ChatService {
       index,
       title: evidence.title,
       url: evidence.url,
-      snippet: this.truncateSnippet(evidence.snippet, 200),
+      snippet: this.normalizeSnippet(evidence.snippet),
       isWhitelistSource: evidence.isWhitelistSource,
     });
     return index;
