@@ -65,6 +65,15 @@
   - 前端将 active task（chatId/taskId/streamSessionId）持久化到 sessionStorage。
   - 刷新后用 snapshot 恢复状态，并在任务未结束时继续流式订阅。
 
+### 模块 G：独立 Agent 层重构（后端解耦）
+
+- Commit: f3ee358
+- 作用：
+  - 将 deep research 执行编排从 chat.service 抽离到独立的 research-agent.service。
+  - chat.service 改为薄委托层，仅暴露研究接口并转发到 agent。
+  - chat.module 注册 ResearchAgentService Provider，形成清晰的服务边界。
+  - 保持 controller 与前端 API 契约不变，降低重构风险并支持按模块回退。
+
 ## 3. 关键文件说明
 
 ### 后端
@@ -74,16 +83,21 @@
   - chat 与 research 两套 SSE 构建函数。
 
 - server/src/chat/chat.service.ts
-  - 深度研究任务状态机核心。
-  - Tavily 检索重试、分支调度、证据采纳/拒绝、报告组装、失败终止。
-  - 研究结果上下文注入普通聊天（follow-up 复用）。
+  - 聊天主流程与普通聊天 SSE。
+  - Deep Research 对外接口薄委托（转发到 ResearchAgentService）。
+  - 研究结果上下文注入普通聊天（从 agent 读取）。
+
+- server/src/chat/research-agent.service.ts
+  - 独立深度研究 agent 层（编排核心）。
+  - 负责任务状态机、计划确认、多轮检索、分支调度、证据采纳/拒绝、报告组装。
+  - 负责研究流会话管理（2 分钟续传窗口）与失败兜底。
 
 - server/src/chat/research-search.adapter.ts
   - Tavily 检索适配器。
   - 后续可替换为其他搜索供应商而不改任务主流程。
 
 - server/src/chat/chat.module.ts
-  - 注册 TavilyResearchSearchAdapter Provider。
+  - 注册 ChatService / ResearchAgentService / TavilyResearchSearchAdapter Provider。
 
 ### 前端
 
