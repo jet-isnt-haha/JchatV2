@@ -15,6 +15,7 @@ import type {
   ChatStreamChunk,
   BranchTreeResponse,
   BranchTreeNode,
+  ConfidenceLevel,
   DeepResearchTask,
   ResearchPlanItem,
   ResearchBranchProgress,
@@ -30,6 +31,10 @@ import type {
 } from "@jchat/shared";
 import { randomUUID } from "crypto";
 import { InMemoryChatRepository } from "./chat.repository";
+import {
+  TavilyResearchSearchAdapter,
+  type ResearchSearchResult,
+} from "./research-search.adapter";
 
 type StreamStatus = "pending" | "streaming" | "completed" | "failed";
 
@@ -73,6 +78,26 @@ export class ChatService {
   private static readonly STREAM_TTL_MS = 2 * 60 * 1000;
   private static readonly MAX_CHUNKS_PER_SESSION = 10000;
   private static readonly MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+  private static readonly RESEARCH_MAX_CONCURRENT_BRANCHES = 3;
+  private static readonly RESEARCH_MAX_ROUNDS = 5;
+  private static readonly RESEARCH_MAX_DURATION_MS = 10 * 60 * 1000;
+  private static readonly RESEARCH_EXTENSION_ROUNDS = 1;
+  private static readonly RESEARCH_TAVILY_MAX_RETRIES = 2;
+  private static readonly RESEARCH_TAVILY_RETRY_DELAYS_MS = [1000, 2000];
+  private static readonly RESEARCH_WHITELIST_SUFFIXES = [
+    "arxiv.org",
+    "nature.com",
+    "science.org",
+    "openai.com",
+    "react.dev",
+    "developer.mozilla.org",
+    "docs.nestjs.com",
+    "who.int",
+    "worldbank.org",
+    "oecd.org",
+    ".gov",
+    ".edu",
+  ];
 
   private llm: ChatOpenAI;
   private streamSessions = new Map<string, StreamSession>();
@@ -84,6 +109,7 @@ export class ChatService {
   constructor(
     private configService: ConfigService,
     private repository: InMemoryChatRepository,
+    private researchSearchAdapter: TavilyResearchSearchAdapter,
   ) {
     this.llm = new ChatOpenAI({
       model: this.configService.get("LLM_MODEL", "gpt-3.5-turbo"),
@@ -400,7 +426,7 @@ export class ChatService {
       }
     }
   }
-  // ===== Deep Research (Skeleton) =====
+  // ===== Deep Research =====
 
   startResearchTask(chatId: string, topic: string): StartResearchTaskResponse {
     this.getChat(chatId);
@@ -425,7 +451,6 @@ export class ChatService {
       createdAt: now,
     };
 
-    // P0 uses deterministic placeholder decomposition before real agent planner is wired.
     const plan: ResearchPlanItem[] = [
       {
         id: randomUUID(),
@@ -445,10 +470,11 @@ export class ChatService {
     ];
 
     const budget: ResearchBudgetProgress = {
-      maxRounds: 5,
+      maxRounds: ChatService.RESEARCH_MAX_ROUNDS,
       currentRound: 0,
-      maxDurationMs: 10 * 60 * 1000,
+      maxDurationMs: ChatService.RESEARCH_MAX_DURATION_MS,
       elapsedMs: 0,
+      etaMs: ChatService.RESEARCH_MAX_DURATION_MS,
       extensionRoundUsed: false,
     };
 
@@ -473,7 +499,6 @@ export class ChatService {
     };
     this.researchStreamSessions.set(streamSessionId, streamSession);
 
-    // Emit first event so UI can render the plan confirmation step immediately.
     this.appendResearchEvent(streamSession, {
       eventType: "plan_ready",
       payload: { task },
@@ -488,7 +513,7 @@ export class ChatService {
     return {
       taskId,
       items: state.plan,
-      maxConcurrentBranches: 3,
+      maxConcurrentBranches: ChatService.RESEARCH_MAX_CONCURRENT_BRANCHES,
       defaultAllSelected: true,
     };
   }
@@ -499,8 +524,11 @@ export class ChatService {
     selectedPlanItemIds: string[],
   ): ConfirmResearchPlanResponse {
     const state = this.getResearchTaskOrThrow(chatId, taskId);
-    const selectedSet = new Set(selectedPlanItemIds);
+    if (state.task.status !== "waiting_confirm") {
+      throw new BadRequestException("Research task is not waiting for confirm");
+    }
 
+    const selectedSet = new Set(selectedPlanItemIds);
     if (selectedSet.size === 0) {
       throw new BadRequestException("At least one plan item must be selected");
     }
@@ -517,36 +545,34 @@ export class ChatService {
       selected: selectedSet.has(item.id),
     }));
 
-    // Selected plan items become branch runtime entries; first one starts as active.
     const selectedItems = state.plan.filter((item) => item.selected);
     state.branches = selectedItems.map((item, index) => ({
       id: randomUUID(),
       planItemId: item.id,
       title: item.title,
-      status: index === 0 ? "retrieving" : "pending",
+      status: "pending",
       queueIndex: index,
-      isActive: index === 0,
+      isActive: false,
     }));
-
-    state.activeSubQuestionTitle = state.branches[0]?.title;
-    state.budget = {
-      ...state.budget,
-      currentRound: 1,
-      elapsedMs: 0,
-      etaMs: state.budget.maxDurationMs,
-    };
 
     state.task = {
       ...state.task,
       status: "running",
       startedAt: Date.now(),
+      completedAt: undefined,
+      errorCode: undefined,
+      errorMessage: undefined,
     };
+
+    state.budget.currentRound = 0;
+    state.budget.elapsedMs = 0;
+    state.budget.etaMs = state.budget.maxDurationMs;
+    state.activeSubQuestionTitle = undefined;
 
     const streamSession = this.getResearchStreamSessionOrThrow(
       state.streamSessionId,
     );
 
-    // Send initial lifecycle and progress events for right-panel streaming UI.
     this.appendResearchEvent(streamSession, {
       eventType: "plan_confirmed",
       payload: { task: state.task },
@@ -555,26 +581,11 @@ export class ChatService {
 
     this.appendResearchEvent(streamSession, {
       eventType: "task_started",
-      payload: {
-        task: state.task,
-        budget: state.budget,
-      },
+      payload: { task: state.task, budget: state.budget },
       done: false,
     });
 
-    for (const branch of state.branches.slice(0, 3)) {
-      this.appendResearchEvent(streamSession, {
-        eventType: "branch_status_changed",
-        payload: { branch },
-        done: false,
-      });
-    }
-
-    this.appendResearchEvent(streamSession, {
-      eventType: "budget_progress",
-      payload: { budget: state.budget },
-      done: false,
-    });
+    void this.executeResearchTask(taskId);
 
     return { task: state.task };
   }
@@ -615,7 +626,6 @@ export class ChatService {
     this.touchResearchSession(session);
 
     let localCursor = Math.max(0, cursorSeq);
-    // Replay buffered events first, then wait for live events.
     const buffered = session.events.filter((event) => event.seq > localCursor);
     for (const event of buffered) {
       localCursor = event.seq;
@@ -669,6 +679,612 @@ export class ChatService {
     }
   }
 
+  private async executeResearchTask(taskId: string): Promise<void> {
+    const state = this.researchTasks.get(taskId);
+    if (!state || state.task.status !== "running") {
+      return;
+    }
+
+    const streamSession = this.getResearchStreamSessionOrThrow(
+      state.streamSessionId,
+    );
+
+    try {
+      let noGainRounds = 0;
+      let previousAccepted = this.countAcceptedEvidence(state);
+
+      while (true) {
+        state.budget.currentRound += 1;
+        this.refreshBudget(state);
+
+        this.appendResearchEvent(streamSession, {
+          eventType: "budget_progress",
+          payload: { budget: state.budget },
+          done: false,
+        });
+
+        const acceptedAdded = await this.processResearchRound(state, streamSession);
+        const currentAccepted = this.countAcceptedEvidence(state);
+
+        if (acceptedAdded <= 0 || currentAccepted <= previousAccepted) {
+          noGainRounds += 1;
+        } else {
+          noGainRounds = 0;
+        }
+        previousAccepted = currentAccepted;
+
+        if (!this.hasWorkableBranch(state)) {
+          break;
+        }
+
+        if (this.isResearchCoverageReached(state)) {
+          break;
+        }
+
+        if (noGainRounds >= 2) {
+          break;
+        }
+
+        this.refreshBudget(state);
+        const roundExceeded = state.budget.currentRound >= state.budget.maxRounds;
+        const timeExceeded = state.budget.elapsedMs >= state.budget.maxDurationMs;
+
+        if (roundExceeded || timeExceeded) {
+          if (!state.budget.extensionRoundUsed) {
+            state.budget.extensionRoundUsed = true;
+            state.budget.maxRounds += ChatService.RESEARCH_EXTENSION_ROUNDS;
+            this.appendResearchEvent(streamSession, {
+              eventType: "budget_progress",
+              payload: { budget: state.budget },
+              done: false,
+            });
+          } else {
+            break;
+          }
+        }
+      }
+
+      this.finalizeResearchTaskSuccess(state, streamSession);
+    } catch (error) {
+      this.finalizeResearchTaskFailure(state, streamSession, error);
+    }
+  }
+
+  private async processResearchRound(
+    state: ResearchTaskState,
+    streamSession: ResearchStreamSession,
+  ): Promise<number> {
+    const candidates = state.branches
+      .filter((branch) => !this.hasBranchCoverage(state, branch.planItemId))
+      .sort((a, b) => (a.queueIndex ?? 0) - (b.queueIndex ?? 0));
+
+    if (candidates.length === 0) {
+      state.activeSubQuestionTitle = undefined;
+      this.refreshBudget(state);
+      return 0;
+    }
+
+    const active = candidates.slice(0, ChatService.RESEARCH_MAX_CONCURRENT_BRANCHES);
+    const activeIds = new Set(active.map((branch) => branch.id));
+
+    for (const branch of state.branches) {
+      if (!activeIds.has(branch.id) && branch.status !== "completed") {
+        this.setResearchBranchStatus(state, streamSession, branch.id, "pending", false);
+      }
+    }
+
+    state.activeSubQuestionTitle = active[0]?.title;
+
+    const roundResults = await Promise.allSettled(
+      active.map((branch) => this.processBranchRound(state, streamSession, branch)),
+    );
+
+    let acceptedAdded = 0;
+    for (const result of roundResults) {
+      if (result.status === "fulfilled") {
+        acceptedAdded += result.value;
+      } else {
+        throw result.reason;
+      }
+    }
+
+    this.refreshBudget(state);
+    this.appendResearchEvent(streamSession, {
+      eventType: "eta_updated",
+      payload: {
+        budget: state.budget,
+        message: state.activeSubQuestionTitle,
+      },
+      done: false,
+    });
+
+    return acceptedAdded;
+  }
+
+  private async processBranchRound(
+    state: ResearchTaskState,
+    streamSession: ResearchStreamSession,
+    branch: ResearchBranchProgress,
+  ): Promise<number> {
+    this.setResearchBranchStatus(state, streamSession, branch.id, "retrieving", true);
+
+    const query = this.buildSearchQuery(state.task.topic, branch.title, state.budget.currentRound);
+    const searchResults = await this.searchWithRetry(query, 6);
+
+    this.setResearchBranchStatus(state, streamSession, branch.id, "reading", true);
+
+    let acceptedAdded = 0;
+    for (const item of searchResults) {
+      const evidence = this.toEvidenceItem(state, branch, item);
+      state.evidence.push(evidence);
+
+      this.appendResearchEvent(streamSession, {
+        eventType: evidence.accepted ? "evidence_added" : "evidence_rejected",
+        payload: { evidence },
+        done: false,
+      });
+
+      if (evidence.accepted) {
+        acceptedAdded += 1;
+      }
+    }
+
+    this.setResearchBranchStatus(state, streamSession, branch.id, "synthesizing", true);
+
+    if (this.hasBranchCoverage(state, branch.planItemId)) {
+      this.setResearchBranchStatus(state, streamSession, branch.id, "completed", false);
+    } else {
+      this.setResearchBranchStatus(state, streamSession, branch.id, "pending", false);
+    }
+
+    return acceptedAdded;
+  }
+
+  private toEvidenceItem(
+    state: ResearchTaskState,
+    branch: ResearchBranchProgress,
+    searchResult: ResearchSearchResult,
+  ): ResearchEvidenceItem {
+    const domain = this.extractDomain(searchResult.url);
+    const snippet = this.normalizeSnippet(searchResult.snippet);
+    const isDuplicate = state.evidence.some(
+      (item) => item.planItemId === branch.planItemId && item.url === searchResult.url,
+    );
+
+    let accepted = true;
+    let rejectReason: string | undefined;
+
+    if (isDuplicate) {
+      accepted = false;
+      rejectReason = "重复来源";
+    } else if (snippet.length < 60) {
+      accepted = false;
+      rejectReason = "摘录信息不足";
+    }
+
+    return {
+      id: randomUUID(),
+      planItemId: branch.planItemId,
+      title: searchResult.title,
+      url: searchResult.url,
+      domain,
+      snippet,
+      accepted,
+      rejectReason,
+      isWhitelistSource: this.isWhitelistDomain(domain),
+      createdAt: Date.now(),
+    };
+  }
+
+  private async searchWithRetry(
+    query: string,
+    maxResults: number,
+  ): Promise<ResearchSearchResult[]> {
+    let lastError: unknown;
+
+    for (
+      let attempt = 0;
+      attempt <= ChatService.RESEARCH_TAVILY_MAX_RETRIES;
+      attempt += 1
+    ) {
+      try {
+        return await this.researchSearchAdapter.search(query, maxResults);
+      } catch (error) {
+        lastError = error;
+        if (attempt >= ChatService.RESEARCH_TAVILY_MAX_RETRIES) {
+          break;
+        }
+        const delay =
+          ChatService.RESEARCH_TAVILY_RETRY_DELAYS_MS[attempt] ??
+          ChatService.RESEARCH_TAVILY_RETRY_DELAYS_MS[
+            ChatService.RESEARCH_TAVILY_RETRY_DELAYS_MS.length - 1
+          ] ??
+          1000;
+        await this.delay(delay);
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error("TAVILY_SEARCH_FAILED");
+  }
+
+  private finalizeResearchTaskSuccess(
+    state: ResearchTaskState,
+    streamSession: ResearchStreamSession,
+  ): void {
+    state.task = {
+      ...state.task,
+      status: "finalizing",
+    };
+
+    for (const branch of state.branches) {
+      if (branch.status !== "completed" || branch.isActive) {
+        this.setResearchBranchStatus(
+          state,
+          streamSession,
+          branch.id,
+          "completed",
+          false,
+        );
+      }
+    }
+
+    state.activeSubQuestionTitle = undefined;
+    state.result = this.buildResearchResult(state);
+    state.task = {
+      ...state.task,
+      status: "completed",
+      completedAt: Date.now(),
+    };
+
+    this.appendResearchEvent(streamSession, {
+      eventType: "report_ready",
+      payload: {
+        task: state.task,
+        result: state.result,
+      },
+      done: true,
+    });
+  }
+
+  private finalizeResearchTaskFailure(
+    state: ResearchTaskState,
+    streamSession: ResearchStreamSession,
+    error: unknown,
+  ): void {
+    const message =
+      error instanceof Error ? error.message : "Deep research execution failed";
+
+    state.task = {
+      ...state.task,
+      status: "failed",
+      completedAt: Date.now(),
+      errorCode: "RESEARCH_FAILED",
+      errorMessage: message,
+    };
+
+    // P0 behavior: failure clears panel state and only surfaces actionable error.
+    state.branches = [];
+    state.evidence = [];
+    state.result = undefined;
+    state.activeSubQuestionTitle = undefined;
+
+    this.appendResearchEvent(streamSession, {
+      eventType: "task_failed",
+      payload: {
+        task: state.task,
+        message:
+          "深度研究失败，请检查 Tavily API Key、网络连接，或稍后重试。",
+      },
+      done: true,
+      errorCode: "RESEARCH_FAILED",
+    });
+  }
+
+  private buildResearchResult(state: ResearchTaskState): ResearchResult {
+    const includedBranches = state.branches.filter((branch) =>
+      this.hasBranchCoverage(state, branch.planItemId),
+    );
+    const unfinishedItems = state.branches
+      .filter((branch) => !this.hasBranchCoverage(state, branch.planItemId))
+      .map((branch) => ({
+        planItemId: branch.planItemId,
+        title: branch.title,
+        reason: "证据不足（需至少3条证据且覆盖2个以上域名）",
+      }));
+
+    const footnotes: ResearchResult["footnotes"] = [];
+    const confidenceSummary: ResearchResult["confidenceSummary"] = [];
+    const report: string[] = [];
+
+    report.push(`# 深度研究报告：${state.task.topic}`);
+    report.push("");
+    report.push("## 执行摘要");
+    report.push(
+      `本次研究共完成 ${includedBranches.length} 条研究路径，累计采纳 ${this.countAcceptedEvidence(
+        state,
+      )} 条证据。报告采用句子级脚注引用，并对非白名单来源自动降权。`,
+    );
+
+    for (const branch of includedBranches) {
+      const acceptedEvidence = this.getAcceptedEvidenceByPlanItem(
+        state,
+        branch.planItemId,
+      );
+      const confidence = this.calculateBranchConfidence(state, branch.planItemId);
+      confidenceSummary.push({
+        claim: branch.title,
+        confidence,
+      });
+
+      report.push("");
+      report.push(`## ${branch.title}`);
+
+      const introRefs = acceptedEvidence.slice(0, 2).map((item) =>
+        this.appendFootnote(footnotes, item),
+      );
+
+      report.push(
+        `该子问题的关键证据呈现一致趋势 ${introRefs
+          .map((index) => this.renderFootnote(index))
+          .join("")}。`,
+      );
+      report.push(`置信度：${this.renderConfidenceLabel(confidence)}。`);
+      report.push("");
+      report.push("关键发现：");
+
+      acceptedEvidence.slice(0, 3).forEach((item, idx) => {
+        const refs = [this.appendFootnote(footnotes, item)];
+        if (idx === 0 && acceptedEvidence[1]) {
+          refs.push(this.appendFootnote(footnotes, acceptedEvidence[1]));
+        }
+        report.push(
+          `- ${this.toClaimSentence(item.snippet)} ${refs
+            .map((index) => this.renderFootnote(index))
+            .join("")}`,
+        );
+      });
+
+      report.push("");
+      report.push("不确定性：");
+      report.push("- 证据来自公开网页文本，时效性与样本完整性可能影响结论稳定性。");
+    }
+
+    report.push("");
+    report.push("## 争议与不确定性总览");
+    const rejectedCount = state.evidence.filter((item) => !item.accepted).length;
+    report.push(`- 本轮检索共拒绝 ${rejectedCount} 条证据，主要原因是重复来源或信息不足。`);
+    report.push("- 对于白名单外来源，系统已自动降权并在置信度计算中体现。\n");
+
+    report.push("## 未完成研究项");
+    if (unfinishedItems.length === 0) {
+      report.push("- 无");
+    } else {
+      for (const item of unfinishedItems) {
+        report.push(`- ${item.title}：${item.reason}`);
+      }
+    }
+
+    report.push("");
+    report.push("## 参考来源");
+    for (const footnote of footnotes) {
+      report.push(`<a id="ref-${footnote.index}"></a>${footnote.index}. [${footnote.title}](${footnote.url})  `);
+      report.push(
+        `摘录：${this.truncateSnippet(footnote.snippet, 200)}  `,
+      );
+      report.push(
+        `来源类型：${footnote.isWhitelistSource ? "白名单来源" : "非白名单来源（已降权）"}`,
+      );
+    }
+
+    const reportMarkdown = report.join("\n");
+    const estimatedInputTokens = Math.ceil(
+      (state.task.topic.length +
+        state.evidence.reduce((sum, item) => sum + item.snippet.length, 0)) /
+        4,
+    );
+    const estimatedOutputTokens = Math.ceil(reportMarkdown.length / 4);
+    const estimatedCostUsd = Number(
+      (estimatedInputTokens * 0.000001 + estimatedOutputTokens * 0.000002).toFixed(
+        6,
+      ),
+    );
+
+    return {
+      reportMarkdown,
+      footnotes,
+      confidenceSummary,
+      unfinishedItems,
+      estimatedInputTokens,
+      estimatedOutputTokens,
+      estimatedCostUsd,
+    };
+  }
+
+  private renderFootnote(index: number): string {
+    return `[${index}](#ref-${index})`;
+  }
+
+  private appendFootnote(
+    footnotes: ResearchResult["footnotes"],
+    evidence: ResearchEvidenceItem,
+  ): number {
+    const index = footnotes.length + 1;
+    footnotes.push({
+      index,
+      title: evidence.title,
+      url: evidence.url,
+      snippet: this.truncateSnippet(evidence.snippet, 200),
+      isWhitelistSource: evidence.isWhitelistSource,
+    });
+    return index;
+  }
+
+  private toClaimSentence(snippet: string): string {
+    const normalized = this.normalizeSnippet(snippet)
+      .replace(/[\r\n]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!normalized) {
+      return "该来源提供了补充性证据。";
+    }
+
+    const shortened = this.truncateSnippet(normalized, 120);
+    return shortened.endsWith("。") ? shortened : `${shortened}。`;
+  }
+
+  private renderConfidenceLabel(confidence: ConfidenceLevel): string {
+    if (confidence === "high") return "高";
+    if (confidence === "medium") return "中";
+    return "低";
+  }
+
+  private calculateBranchConfidence(
+    state: ResearchTaskState,
+    planItemId: string,
+  ): ConfidenceLevel {
+    const accepted = this.getAcceptedEvidenceByPlanItem(state, planItemId);
+    if (accepted.length === 0) {
+      return "low";
+    }
+
+    const domainCount = new Set(accepted.map((item) => item.domain)).size;
+    const whitelistCount = accepted.filter((item) => item.isWhitelistSource).length;
+    const whitelistRatio = whitelistCount / accepted.length;
+
+    let score = 0;
+    if (accepted.length >= 3) score += 2;
+    if (accepted.length >= 5) score += 1;
+    if (domainCount >= 2) score += 2;
+    if (whitelistRatio >= 0.7) score += 2;
+    else if (whitelistRatio >= 0.4) score += 1;
+    else score -= 1;
+
+    if (score >= 5) return "high";
+    if (score >= 3) return "medium";
+    return "low";
+  }
+
+  private hasWorkableBranch(state: ResearchTaskState): boolean {
+    return state.branches.some((branch) => !this.hasBranchCoverage(state, branch.planItemId));
+  }
+
+  private isResearchCoverageReached(state: ResearchTaskState): boolean {
+    if (state.branches.length === 0) {
+      return false;
+    }
+    return state.branches.every((branch) =>
+      this.hasBranchCoverage(state, branch.planItemId),
+    );
+  }
+
+  private hasBranchCoverage(state: ResearchTaskState, planItemId: string): boolean {
+    const accepted = this.getAcceptedEvidenceByPlanItem(state, planItemId);
+    if (accepted.length < 3) {
+      return false;
+    }
+    const domainCount = new Set(accepted.map((item) => item.domain)).size;
+    return domainCount >= 2;
+  }
+
+  private getAcceptedEvidenceByPlanItem(
+    state: ResearchTaskState,
+    planItemId: string,
+  ): ResearchEvidenceItem[] {
+    return state.evidence.filter(
+      (item) => item.planItemId === planItemId && item.accepted,
+    );
+  }
+
+  private countAcceptedEvidence(state: ResearchTaskState): number {
+    return state.evidence.filter((item) => item.accepted).length;
+  }
+
+  private setResearchBranchStatus(
+    state: ResearchTaskState,
+    streamSession: ResearchStreamSession,
+    branchId: string,
+    status: ResearchBranchProgress["status"],
+    isActive: boolean,
+  ): void {
+    const index = state.branches.findIndex((branch) => branch.id === branchId);
+    if (index === -1) {
+      return;
+    }
+
+    const current = state.branches[index];
+    if (current.status === status && current.isActive === isActive) {
+      return;
+    }
+
+    const updated: ResearchBranchProgress = {
+      ...current,
+      status,
+      isActive,
+    };
+    state.branches[index] = updated;
+
+    this.appendResearchEvent(streamSession, {
+      eventType: "branch_status_changed",
+      payload: { branch: updated },
+      done: false,
+    });
+  }
+
+  private refreshBudget(state: ResearchTaskState): void {
+    const startedAt = state.task.startedAt ?? state.task.createdAt;
+    const elapsed = Date.now() - startedAt;
+    state.budget.elapsedMs = elapsed;
+
+    if (state.budget.currentRound <= 0) {
+      state.budget.etaMs = state.budget.maxDurationMs;
+      return;
+    }
+
+    const avgRoundMs = elapsed / state.budget.currentRound;
+    const remainingRounds = Math.max(0, state.budget.maxRounds - state.budget.currentRound);
+    const byRound = avgRoundMs * remainingRounds;
+    const byTimeCap = Math.max(0, state.budget.maxDurationMs - elapsed);
+
+    state.budget.etaMs = Math.max(0, Math.min(byRound, byTimeCap));
+  }
+
+  private buildSearchQuery(topic: string, branchTitle: string, round: number): string {
+    return `${topic} ${branchTitle} 研究证据 round ${round}`;
+  }
+
+  private extractDomain(url: string): string {
+    try {
+      return new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    } catch {
+      return "unknown";
+    }
+  }
+
+  private isWhitelistDomain(domain: string): boolean {
+    const normalized = domain.toLowerCase();
+    return ChatService.RESEARCH_WHITELIST_SUFFIXES.some((suffix) =>
+      normalized === suffix || normalized.endsWith(`.${suffix}`) || normalized.endsWith(suffix),
+    );
+  }
+
+  private normalizeSnippet(snippet: string): string {
+    return snippet.replace(/\s+/g, " ").trim();
+  }
+
+  private truncateSnippet(snippet: string, maxLength: number): string {
+    if (snippet.length <= maxLength) {
+      return snippet;
+    }
+    return `${snippet.slice(0, maxLength)}...`;
+  }
+
+  private async delay(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
   private getResearchTaskOrThrow(
     chatId: string,
     taskId: string,
@@ -700,7 +1316,6 @@ export class ChatService {
     session: ResearchStreamSession,
     event: Omit<ResearchStreamEvent, "streamId" | "seq">,
   ): ResearchStreamEvent {
-    // Sequence is assigned only on server side to keep replay ordering canonical.
     session.seq += 1;
     const nextEvent: ResearchStreamEvent = {
       streamId: session.streamId,
@@ -730,7 +1345,6 @@ export class ChatService {
     const now = Date.now();
     for (const [id, session] of this.researchStreamSessions.entries()) {
       if (session.expireAt <= now) {
-        // Stream payloads are temporary; eviction follows the same TTL window as chat SSE.
         this.researchStreamSessions.delete(id);
       }
     }
