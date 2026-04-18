@@ -1,6 +1,7 @@
 import type {
   BranchMessagesResponse,
   BranchTreeResponse,
+  ChatDetailResponse,
   ConfirmResearchPlanResponse,
   CreateBranchResponse,
   CreateChatResponse,
@@ -25,6 +26,10 @@ function buildStreamUrl(path: string, cursorSeq?: number) {
 export const chatApi = {
   createChat() {
     return requestJson<CreateChatResponse>("/api/chats", { method: "POST" });
+  },
+
+  getChatDetail(chatId: string) {
+    return requestJson<ChatDetailResponse>(`/api/chats/${chatId}`);
   },
 
   getBranchTree(chatId: string) {

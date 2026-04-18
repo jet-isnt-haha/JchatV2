@@ -28,6 +28,13 @@ import { chatApi } from "@/services/chatApi";
 import { useErrorActions } from "@/providers/error/ErrorProvider";
 
 const RESEARCH_VISIBLE_EVIDENCE_LIMIT = 200;
+const ACTIVE_RESEARCH_STORAGE_KEY = "jchat.deep_research.active";
+
+interface ActiveResearchContext {
+  chatId: string;
+  taskId: string;
+  streamSessionId: string;
+}
 
 interface ResearchEvidenceState {
   visible: ResearchEvidenceItem[];
@@ -57,6 +64,36 @@ function getTaskBusy(task: DeepResearchTask | null): boolean {
     task.status === "running" ||
     task.status === "finalizing"
   );
+}
+
+function readActiveResearchContext(): ActiveResearchContext | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const raw = window.sessionStorage.getItem(ACTIVE_RESEARCH_STORAGE_KEY);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<ActiveResearchContext>;
+    if (
+      !parsed.chatId ||
+      !parsed.taskId ||
+      !parsed.streamSessionId
+    ) {
+      return null;
+    }
+
+    return {
+      chatId: parsed.chatId,
+      taskId: parsed.taskId,
+      streamSessionId: parsed.streamSessionId,
+    };
+  } catch {
+    return null;
+  }
 }
 
 interface ChatContextValue {
@@ -132,7 +169,29 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   researchTaskRef.current = researchTask;
 
   const researchStreamRef = useRef<EventSource | null>(null);
+  const activeResearchContextRef = useRef<ActiveResearchContext | null>(null);
   const insertedResearchReportTaskIdsRef = useRef(new Set<string>());
+
+  const persistActiveResearchContext = useCallback(
+    (context: ActiveResearchContext | null) => {
+      activeResearchContextRef.current = context;
+
+      if (typeof window === "undefined") {
+        return;
+      }
+
+      if (!context) {
+        window.sessionStorage.removeItem(ACTIVE_RESEARCH_STORAGE_KEY);
+        return;
+      }
+
+      window.sessionStorage.setItem(
+        ACTIVE_RESEARCH_STORAGE_KEY,
+        JSON.stringify(context),
+      );
+    },
+    [],
+  );
 
   const initChat = useCallback(async (): Promise<CreateChatResponse> => {
     const data = await chatApi.createChat();
@@ -394,6 +453,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
         setResearchErrorMessage("");
         setDeepResearchEnabledState(false);
+        persistActiveResearchContext(null);
       }
 
       if (event.eventType === "task_failed") {
@@ -411,9 +471,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             "深度研究失败，请检查 Tavily key、网络状态并稍后重试。",
         );
         setDeepResearchEnabledState(false);
+        persistActiveResearchContext(null);
       }
     },
-    [appendResearchReportToTimeline],
+    [appendResearchReportToTimeline, persistActiveResearchContext],
   );
 
   const recoverResearchFromSnapshot = useCallback(
@@ -435,6 +496,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         setResearchResult(result);
         appendResearchReportToTimeline(taskId, result);
         setDeepResearchEnabledState(false);
+        persistActiveResearchContext(null);
       }
 
       if (snapshot.task.status === "failed") {
@@ -447,9 +509,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             "深度研究失败，请检查 Tavily key、网络状态并稍后重试。",
         );
         setDeepResearchEnabledState(false);
+        persistActiveResearchContext(null);
       }
     },
-    [appendResearchReportToTimeline],
+    [appendResearchReportToTimeline, persistActiveResearchContext],
   );
 
   const receiveResearchStream = useCallback(
@@ -518,6 +581,61 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [applyResearchEvent, recoverResearchFromSnapshot],
   );
 
+  useEffect(() => {
+    let disposed = false;
+
+    const restore = async () => {
+      if (chatRef.current) {
+        return;
+      }
+
+      const persisted = readActiveResearchContext();
+      if (!persisted) {
+        return;
+      }
+
+      try {
+        const detail = await chatApi.getChatDetail(persisted.chatId);
+        if (disposed) {
+          return;
+        }
+
+        setChat(detail.chat);
+        setBranches(detail.branches);
+
+        await loadBranchTree(persisted.chatId);
+        await loadBranchMessages(persisted.chatId, detail.chat.currentBranchId);
+        await recoverResearchFromSnapshot(persisted.chatId, persisted.taskId);
+
+        const restoredTask = researchTaskRef.current;
+        if (restoredTask && getTaskBusy(restoredTask)) {
+          persistActiveResearchContext(persisted);
+          void receiveResearchStream(
+            persisted.chatId,
+            persisted.taskId,
+            persisted.streamSessionId,
+          );
+        } else {
+          persistActiveResearchContext(null);
+        }
+      } catch {
+        persistActiveResearchContext(null);
+      }
+    };
+
+    void restore();
+
+    return () => {
+      disposed = true;
+    };
+  }, [
+    loadBranchMessages,
+    loadBranchTree,
+    persistActiveResearchContext,
+    receiveResearchStream,
+    recoverResearchFromSnapshot,
+  ]);
+
   const startDeepResearch = useCallback(
     async (topic: string) => {
       if (getTaskBusy(researchTaskRef.current)) {
@@ -540,6 +658,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           topic,
         );
         setResearchTask(task);
+        persistActiveResearchContext({
+          chatId: currentChat.id,
+          taskId: task.id,
+          streamSessionId,
+        });
 
         const plan = await chatApi.getResearchPlan(currentChat.id, task.id);
         setResearchPlan(plan.items);
@@ -551,11 +674,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       } catch (err) {
         showError(err);
         setResearchErrorMessage("深度研究启动失败，请重试。");
+        persistActiveResearchContext(null);
       }
     },
     [
       closeResearchStream,
       initChat,
+      persistActiveResearchContext,
       receiveResearchStream,
       resetResearchPanelState,
       showError,
